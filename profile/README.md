@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./volare-logo.png" alt="Volare Consulting" width="320" />
+</p>
+
 # Volare Consulting
 
 > Your ideas taking flight.
@@ -10,7 +14,7 @@ A handful of repos here do most of the work. Three of them define how Volare shi
 
 ### `volare-brand` — how Volare presents itself
 
-The single source of truth for colors, typography, components, voice, naming, and logo. Every Volare-built artifact — proposals, marketing, product UI, customer email, internal Slack — draws from it. One brand, two registers (external and internal), same personality.
+The single source of truth for colors, typography, components, voice, naming, and logo. Every Volare-built artifact — proposals, marketing, product UI, customer email — draws from it. One brand, two registers (external and internal), same personality.
 
 ### `pilota` — the SDLC engine
 
