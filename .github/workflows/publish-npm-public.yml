@@ -22,10 +22,18 @@ name: publish-npm-public
 #       secrets:
 #         NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 #
-# Flow: install -> build -> test -> (verify tag == package.json version) ->
-# npm publish --access public. No version bump and no git push — the published
-# version is whatever the tag points at, which keeps releases explicit and
-# avoids the loop-safety dance build-npm-package.yml needs.
+# Monorepo: the install runs at the repo root (so npm workspaces resolve), but
+# the build, tag-verify, and publish run in `working-directory`. Point it at the
+# publishable workspace and the root can stay private:
+#
+#       with:
+#         working-directory: "packages/core"
+#
+# Flow: install (root) -> build -> test -> (verify tag == package.json version)
+# -> npm publish --access public, the last three in `working-directory`. No
+# version bump and no git push — the published version is whatever the tag
+# points at, which keeps releases explicit and avoids the loop-safety dance
+# build-npm-package.yml needs.
 
 on:
   workflow_call:
@@ -60,6 +68,11 @@ on:
         required: false
         type: boolean
         default: true
+      working-directory:
+        description: "Directory of the package to build, verify, and publish. Defaults to the repo root; set to a workspace path (e.g. 'packages/core') for a monorepo whose root package is private."
+        required: false
+        type: string
+        default: "."
     secrets:
       NPM_TOKEN:
         description: "Automation token for the @volare-consulting npm org with publish rights."
@@ -78,18 +91,23 @@ jobs:
           node-version: ${{ inputs.node-version }}
           registry-url: "https://registry.npmjs.org"
 
+      # Install at the repo root so npm workspaces resolve. For a single-package
+      # repo the root IS the package, so this is correct in both layouts.
       - name: Clean install
         run: npm ci
 
       - name: Build
+        working-directory: ${{ inputs.working-directory }}
         run: ${{ inputs.build-command }}
 
       - name: Test
         if: inputs.skip-tests != true
+        working-directory: ${{ inputs.working-directory }}
         run: ${{ inputs.test-command }}
 
       - name: Verify tag matches package version
         if: inputs.verify-tag == true && startsWith(github.ref, 'refs/tags/v')
+        working-directory: ${{ inputs.working-directory }}
         run: |
           set -euo pipefail
           TAG_VERSION="${GITHUB_REF_NAME#v}"
@@ -101,6 +119,7 @@ jobs:
           echo "Publishing version $PKG_VERSION"
 
       - name: Publish to npm
+        working-directory: ${{ inputs.working-directory }}
         run: npm publish --access ${{ inputs.access }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
