@@ -1,0 +1,106 @@
+name: publish-npm-public
+
+# Reusable workflow: publish a package to the PUBLIC npm registry (npmjs.org).
+#
+# Sister to build-npm-package.yml — that one targets GitHub Packages
+# (npm.pkg.github.com, @volare-consulting-software, GITHUB_TOKEN) for internal
+# libraries. THIS one publishes open-source packages to the public registry
+# under the @volare-consulting npm org, authenticating with an NPM_TOKEN.
+#
+# Intended for tag-driven releases. The CALLER triggers on a `v*` tag and calls
+# this workflow, passing the NPM_TOKEN secret:
+#
+#   # .github/workflows/publish.yml in the consumer repo
+#   on:
+#     push:
+#       tags: ["v*"]
+#   jobs:
+#     publish:
+#       uses: Volare-Consulting-Software/Volare.Build/.github/workflows/publish-npm-public.yml@main
+#       with:
+#         node-version: "20"
+#       secrets:
+#         NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+#
+# Flow: install -> build -> test -> (verify tag == package.json version) ->
+# npm publish --access public. No version bump and no git push — the published
+# version is whatever the tag points at, which keeps releases explicit and
+# avoids the loop-safety dance build-npm-package.yml needs.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Version range passed to actions/setup-node."
+        required: false
+        type: string
+        default: "20"
+      build-command:
+        description: "Build command run before publishing."
+        required: false
+        type: string
+        default: "npm run build"
+      test-command:
+        description: "Test command. Skipped entirely when `skip-tests` is true."
+        required: false
+        type: string
+        default: "npm test"
+      skip-tests:
+        description: "When true, skip the test step."
+        required: false
+        type: boolean
+        default: false
+      access:
+        description: "npm access level. 'public' is required for scoped packages to be public."
+        required: false
+        type: string
+        default: "public"
+      verify-tag:
+        description: "When true and the run is tag-triggered, assert the git tag (vX.Y.Z) equals package.json version."
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      NPM_TOKEN:
+        description: "Automation token for the @volare-consulting npm org with publish rights."
+        required: true
+
+jobs:
+  publish-npm-public:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Clean install
+        run: npm ci
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - name: Test
+        if: inputs.skip-tests != true
+        run: ${{ inputs.test-command }}
+
+      - name: Verify tag matches package version
+        if: inputs.verify-tag == true && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
+            exit 1
+          fi
+          echo "Publishing version $PKG_VERSION"
+
+      - name: Publish to npm
+        run: npm publish --access ${{ inputs.access }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
