@@ -1,0 +1,194 @@
+name: build-npm-package
+
+# Reusable build+publish workflow for Volare npm packages (TypeScript/React
+# libraries published to GitHub Packages under the @volare-consulting-software scope).
+# Sister to build-dotnet-package.yml (.NET/NuGet) — different ecosystem, same shape:
+#   PR run:    install -> build -> test only. No version bump, no publish.
+#   main push: install -> build -> test -> bump (npm version patch) -> publish
+#              -> push the bump commit (and its tag) back to main.
+#
+# IMPORTANT for adopters: this workflow publishes the CONTENTS of the
+# `publish-dir` directory (default `./dist`) — the package.json is copied
+# into publish-dir before `npm publish ./<publish-dir>`. The resulting
+# tarball is "flat": consumers see files at the package root, not under
+# `dist/`. This means deep imports like
+# `@volare-consulting-software/<pkg>/Access/BaseAccess` resolve to
+# `node_modules/@volare-consulting-software/<pkg>/Access/BaseAccess` directly.
+#
+# Do NOT add a `files: ["dist"]` field to consumer package.json — that's
+# only relevant when publishing from the project root, which is not what
+# this workflow does.
+#
+# Loop safety on the bump push — CANNOT retrigger this workflow:
+#   1. The bump commit message contains [skip ci] (GitHub natively skips runs
+#      when a push's commit message has the skip token).
+#   2. Pushes authenticated by GITHUB_TOKEN never trigger workflows by policy
+#      (workflow_dispatch and repository_dispatch are the only exempt events).
+# Both guards are intentional; keep both.
+#
+# Draft PRs do not trigger this workflow's work — see the job-level `if:`.
+# Callers should add `ready_for_review` to their `pull_request: types:` list
+# so the build runs when a draft is flipped to ready:
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review]
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Version range passed to actions/setup-node."
+        required: false
+        type: string
+        default: "24.x"
+      build-command:
+        description: "Build command. Default matches the typical convention (tsc + asset copy via package scripts)."
+        required: false
+        type: string
+        default: "npm run typescript:build"
+      test-command:
+        description: "Test command. Skipped entirely when `skip-tests` is true."
+        required: false
+        type: string
+        default: "npm test"
+      skip-tests:
+        description: "When true, skip the test step. Use on push-to-main when tests already ran on the PR. Default false so PRs always test."
+        required: false
+        type: boolean
+        default: false
+      publish-dir:
+        description: "Directory whose CONTENTS get published as the tarball root. Defaults to ./dist (the build output)."
+        required: false
+        type: string
+        default: "./dist"
+      publish-package:
+        description: "Whether to bump version + publish to GitHub Packages + push the bump. Set true on push-to-main / workflow_dispatch; false on PRs."
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      package-version:
+        description: "Bumped version applied to package.json and published. Empty on PR runs."
+        value: ${{ jobs.build-npm-package.outputs.package-version }}
+
+permissions:
+  contents: write   # for the version-bump commit + git push --follow-tags
+  packages: write   # for npm publish to GitHub Packages
+
+# Serialize publish runs so two near-simultaneous merges can't race on
+# `npm publish` + `git push`. Subsequent runs queue rather than cancel —
+# every main commit gets its own published version.
+concurrency:
+  group: build-npm-package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-npm-package:
+    # Skip on draft PRs. Push-to-main and workflow_dispatch have no
+    # pull_request payload, so the first clause keeps them running.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    outputs:
+      package-version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 + token persistence lets `npm version patch` create
+          # a real commit + tag that the later `git push --follow-tags` can
+          # push back to main.
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          # setup-node writes a project .npmrc with the registry + scope and
+          # tells npm to read its auth token from $NODE_AUTH_TOKEN. We also
+          # export NPM_TOKEN below because some checked-in .npmrc files
+          # reference ${NPM_TOKEN} directly — either name works.
+          registry-url: https://npm.pkg.github.com
+          scope: '@volare-consulting-software'
+
+      - name: Clean install
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm ci
+
+      - name: Build
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ${{ inputs.build-command }}
+
+      - name: Test
+        if: inputs.skip-tests != true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ${{ inputs.test-command }}
+
+      - name: Configure git
+        if: inputs.publish-package == true
+        run: |
+          git config user.email "build-server@go-volare.com"
+          git config user.name "build-server"
+
+      - name: Bump version
+        id: bump
+        if: inputs.publish-package == true
+        run: |
+          # `npm version patch` rewrites package.json, makes a commit, and tags
+          # it. --force lets it succeed even when the tree had untracked files
+          # produced by the build step (dist/, etc).
+          new_tag=$(npm version patch -m "Bump version to %s [skip ci]" --force)
+          # Strip the leading `v` that npm prepends to the tag.
+          echo "version=${new_tag#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Copy package.json into publish dir
+        if: inputs.publish-package == true && inputs.publish-dir != '.' && inputs.publish-dir != ''
+        run: cp package.json "${{ inputs.publish-dir }}/package.json"
+
+      - name: Publish to GitHub Packages
+        if: inputs.publish-package == true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Publishes the CONTENTS of publish-dir as the tarball root (so
+        # consumers see deep paths like `@volare-consulting-software/.../Access/X`
+        # resolve at the top level — not nested under dist/).
+        #
+        # dist-tag selection:
+        #   main           -> latest      (default; tracks the newest line)
+        #   release/X.Y    -> release-X.Y (maintenance lines older than main can
+        #                                  still publish — npm refuses to assign
+        #                                  "latest" to a version below the
+        #                                  existing latest. dist-tags can't look
+        #                                  like semver ranges, so we prefix with
+        #                                  "release-".)
+        #   anything else  -> latest      (workflow_dispatch from feature
+        #                                  branches would shadow latest;
+        #                                  uncommon, but keeps behavior
+        #                                  predictable)
+        # Consumers always pin via package.json semver constraints, so the
+        # dist-tag value isn't load-bearing for resolution — it only matters
+        # for unconstrained `npm install <pkg>` calls.
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF#refs/heads/}"
+          case "$ref" in
+            release/*)
+              dist_tag="release-$(echo "${ref#release/}" | tr '/' '-')"
+              ;;
+            *)
+              dist_tag="latest"
+              ;;
+          esac
+          target="${{ inputs.publish-dir }}"
+          [ -z "$target" ] && target="."
+          echo "Publishing $target with dist-tag: $dist_tag (branch: $ref)"
+          npm publish "$target" --tag "$dist_tag"
+
+      - name: Push version bump
+        if: inputs.publish-package == true
+        run: git push --follow-tags

@@ -1,0 +1,171 @@
+name: build-dotnet-package
+
+# Reusable build+pack+publish workflow for Volare .NET NuGet libraries.
+# - Delegates restore/build/test to the shared `build-and-test` composite action
+# - Reads <Version> from the package csproj, packs with --include-symbols
+# - Pushes to https://nuget.pkg.github.com/Volare-Consulting-Software/index.json with --skip-duplicate
+#   (so re-running on the same version is a no-op rather than a failure)
+#
+# Draft PRs do not trigger this workflow's work — see the job-level `if:` below.
+# Callers should add `ready_for_review` to their `pull_request: types:` list so
+# the build runs when a draft is flipped to ready:
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review]
+
+on:
+  workflow_call:
+    inputs:
+      package-csproj:
+        description: "Path to the .csproj that produces the package (e.g., Volare.Core/Volare.Core.csproj)."
+        required: true
+        type: string
+      package-name:
+        description: "Package id used in the nupkg filename. If empty, derives from the csproj basename."
+        required: false
+        type: string
+        default: ""
+      dotnet-version:
+        description: "Version range for actions/setup-dotnet."
+        required: false
+        type: string
+        default: "10.x"
+      build-configuration:
+        description: "MSBuild configuration."
+        required: false
+        type: string
+        default: "Release"
+      test-filter:
+        description: "Filter expression for dotnet test."
+        required: false
+        type: string
+        default: "TestCategory!=IntegrationTest"
+      include-symbols:
+        description: "Pass --include-symbols to dotnet pack so a .symbols.nupkg is produced and pushed."
+        required: false
+        type: boolean
+        default: true
+      extra-pack-args:
+        description: "Extra args appended to dotnet pack (e.g. -p:NoWarn=NU5104, -p:NuspecFile=Custom.nuspec)."
+        required: false
+        type: string
+        default: ""
+      skip-tests:
+        description: "When true, skip dotnet test (still restores/builds). Use on push-to-main where tests already ran on the PR."
+        required: false
+        type: boolean
+        default: false
+      version-suffix:
+        description: "SemVer pre-release suffix (no leading hyphen). When set, the package is versioned <base>.<run_number>-<suffix> and Pack/Push run on any branch. When empty (default), Pack/Push only run on push to main."
+        required: false
+        type: string
+        default: ""
+    outputs:
+      package-version:
+        description: "The PackageVersion read from the csproj and used in the nupkg filename."
+        value: ${{ jobs.build-dotnet-package.outputs.package-version }}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-dotnet-package:
+    # Skip on draft PRs. Push-to-main and workflow_dispatch have no
+    # pull_request payload, so the first clause keeps them running.
+    # Caller's `pull_request: types:` must include `ready_for_review`
+    # for the build to auto-trigger when a draft is marked ready.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    env:
+      DOTNET_NOLOGO: "true"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+      BuildConfiguration: ${{ inputs.build-configuration }}
+    outputs:
+      package-version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build & test
+        uses: Volare-Consulting-Software/.github/.github/actions/build-and-test@main
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+          build-configuration: ${{ inputs.build-configuration }}
+          test-filter: ${{ inputs.test-filter }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          skip-tests: ${{ inputs.skip-tests }}
+
+      # Pack + push run on either:
+      #   - push to main (release version: <base>.<run_number>), or
+      #   - any branch with `version-suffix` set (pre-release: <base>.<run_number>-<suffix>).
+      # PR runs do build + test only — versions on GitHub Packages are immutable,
+      # so we don't burn a version number per PR push.
+      - name: Compute PackageVersion
+        if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || inputs.version-suffix != ''
+        id: version
+        run: |
+          # csproj <Version> element supplies the major.minor; github.run_number
+          # supplies the patch. Final version: "<base>.<run_number>[-<suffix>]"
+          base=$(grep -oP '(?<=<Version>)[^<]+(?=</Version>)' "${{ inputs.package-csproj }}" | head -1 | tr -d '[:space:]')
+          if [ -z "$base" ]; then
+            echo "::error::No <Version> element found in ${{ inputs.package-csproj }}" && exit 1
+          fi
+          version="${base}.${{ github.run_number }}"
+          suffix="${{ inputs.version-suffix }}"
+          if [ -n "$suffix" ]; then
+            # SemVer pre-release identifier: one or more dot-separated tokens of [0-9A-Za-z-].
+            if ! printf '%s' "$suffix" | grep -Eq '^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$'; then
+              echo "::error::version-suffix '$suffix' is not a valid SemVer pre-release identifier (allowed: [0-9A-Za-z-], dot-separated)." && exit 1
+            fi
+            version="${version}-${suffix}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Computed package version: $version (csproj base: $base, run_number: ${{ github.run_number }}, suffix: ${suffix:-<none>})"
+
+      - name: Pack
+        if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || inputs.version-suffix != ''
+        env:
+          VERSION_BUILD: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p artifacts
+          symbols_flag=""
+          if [ "${{ inputs.include-symbols }}" = "true" ]; then
+            symbols_flag="--include-symbols"
+          fi
+          # shellcheck disable=SC2086
+          dotnet pack "${{ inputs.package-csproj }}" \
+            --no-build \
+            --configuration "$BuildConfiguration" \
+            -p:PackageVersion="$VERSION_BUILD" \
+            $symbols_flag \
+            -o artifacts \
+            ${{ inputs.extra-pack-args }}
+
+      - name: Push to GitHub Packages
+        if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || inputs.version-suffix != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find every nupkg produced by pack — NuGet normalizes versions
+          # ("10.2" -> "10.2.0") and `--include-symbols` produces a separate
+          # `.symbols.nupkg` rather than `.snupkg`, so we glob instead of
+          # reconstructing the filename.
+          shopt -s nullglob
+          nupkgs=(artifacts/*.nupkg)
+          if [ ${#nupkgs[@]} -eq 0 ]; then
+            echo "::error::No .nupkg files produced in artifacts/" >&2
+            ls -la artifacts >&2
+            exit 1
+          fi
+
+          for pkg in "${nupkgs[@]}"; do
+            echo "Pushing $pkg"
+            dotnet nuget push "$pkg" \
+              --source "https://nuget.pkg.github.com/Volare-Consulting-Software/index.json" \
+              --api-key "$GH_TOKEN" \
+              --skip-duplicate
+          done

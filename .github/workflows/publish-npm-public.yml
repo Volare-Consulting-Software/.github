@@ -16,7 +16,7 @@ name: publish-npm-public
 #       tags: ["v*"]
 #   jobs:
 #     publish:
-#       uses: Volare-Consulting-Software/Volare.Build/.github/workflows/publish-npm-public.yml@main
+#       uses: Volare-Consulting-Software/.github/.github/workflows/publish-npm-public.yml@main
 #       with:
 #         node-version: "20"
 #       secrets:

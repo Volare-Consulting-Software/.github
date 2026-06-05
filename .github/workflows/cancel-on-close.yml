@@ -1,0 +1,40 @@
+name: cancel-on-close
+
+# Reusable workflow that cancels any in-flight `build.yml` run for the PR
+# that just closed. Call from a per-service `cancel-on-close.yml` caller
+# that triggers on `pull_request: closed` — when an admin-bypass-merges a
+# PR while its build is still running, the in-flight build keeps burning
+# runner minutes for an outcome no one's waiting on. This kills it.
+#
+# The cancel is triple-scoped to avoid touching anything else on the same
+# branch:
+#   --workflow build.yml      only the build workflow
+#   --branch <pr head ref>    only this PR's source branch
+#   --event pull_request      only the PR-triggered run (not a workflow_dispatch
+#                             someone may have fired on the same branch)
+#
+# Caller must declare `permissions: actions: write` so the implicit
+# GITHUB_TOKEN can cancel runs.
+
+on:
+  workflow_call:
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow build.yml \
+            --branch "${{ github.event.pull_request.head.ref }}" \
+            --event pull_request \
+            --status in_progress \
+            --json databaseId \
+            --jq '.[].databaseId' \
+            | xargs -r -I{} gh run cancel {} --repo "${{ github.repository }}"
