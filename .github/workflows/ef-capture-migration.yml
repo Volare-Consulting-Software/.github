@@ -1,0 +1,190 @@
+name: ef-capture-migration
+
+# Reusable workflow that keeps EF Core migrations in step with the model on a
+# push to main. For each context it runs `dotnet ef migrations
+# has-pending-model-changes`; when drift is detected it generates a migration
+# (`Auto_<run_number>`) and commits it back to the branch with `[skip ci]`. The
+# resulting HEAD sha is exposed as an output.
+#
+# Intended for the push-to-main path only. Migrations are normally authored in
+# the PR; this is the safety net that catches a model change shipped without one.
+# Restore authenticates to the Volare GitHub Packages feed (mirrors
+# build-and-test); ef runs `--no-build` against the pre-built output. The
+# dotnet-ef tool version is taken from the project's EF Core package version.
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: "EF migrations project (directory or .csproj)."
+        required: true
+        type: string
+      startup-project:
+        description: "EF startup project (must reference Microsoft.EntityFrameworkCore.Design). Optional — defaults to `project` when the migrations project is self-startup."
+        required: false
+        type: string
+        default: ""
+      contexts:
+        description: "JSON array of DbContext names to check, e.g. [\"BackOfficeContext\"]."
+        required: true
+        type: string
+      migrations-root:
+        description: "Output base for new migrations, relative to the project. Each context goes to <root>/<context without 'Context'>."
+        required: false
+        type: string
+        default: "Migrations"
+      dotnet-version:
+        description: "Version range passed to actions/setup-dotnet."
+        required: false
+        type: string
+        default: "10.x"
+      git-user-name:
+        description: "Author name for the captured-migration commit."
+        required: false
+        type: string
+        default: "build-server"
+      git-user-email:
+        description: "Author email for the captured-migration commit."
+        required: false
+        type: string
+        default: "build-server@go-volare.com"
+    outputs:
+      head-sha:
+        description: "The branch HEAD sha after capture (equals github.sha when no migration was committed)."
+        value: ${{ jobs.capture.outputs.head-sha }}
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    outputs:
+      head-sha: ${{ steps.result.outputs.head-sha }}
+    steps:
+      # fetch-depth: 0 + persisted token lets the commit below push back to the
+      # branch (mirrors build-npm-package.yml's version-bump pattern).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Configure NuGet (GitHub Packages)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > ci-nuget.config <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+              <add key="volare" value="https://nuget.pkg.github.com/Volare-Consulting-Software/index.json" />
+            </packageSources>
+            <packageSourceCredentials>
+              <volare>
+                <add key="Username" value="github-actions" />
+                <add key="ClearTextPassword" value="__GH_TOKEN__" />
+              </volare>
+            </packageSourceCredentials>
+          </configuration>
+          EOF
+          sed -i "s|__GH_TOKEN__|${GH_TOKEN}|" ci-nuget.config
+
+      - name: Resolve startup project & EF version
+        shell: bash
+        env:
+          PROJECT: ${{ inputs.project }}
+          STARTUP_INPUT: ${{ inputs.startup-project }}
+        run: |
+          set -euo pipefail
+          # Startup project defaults to the migrations project (self-startup).
+          startup="${STARTUP_INPUT:-$PROJECT}"
+          echo "STARTUP=${startup}" >> "$GITHUB_ENV"
+          # dotnet-ef version comes from the project's EF Core package version.
+          case "$PROJECT" in
+            *.csproj) csproj="$PROJECT" ;;
+            *)        csproj=$(ls "$PROJECT"/*.csproj | head -1) ;;
+          esac
+          ef_ver=$(grep -oP 'Microsoft\.EntityFrameworkCore\.(Design|Tools)"[^>]*Version="\K[^"]+' "$csproj" | head -1)
+          if [ -z "$ef_ver" ]; then
+            echo "Could not determine EF Core version from $csproj" >&2; exit 1
+          fi
+          echo "EF_VERSION=${ef_ver}" >> "$GITHUB_ENV"
+          echo "startup=${startup}  ef-version=${ef_ver}"
+
+      - name: Restore & build (Debug, matches ef --no-build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore "$STARTUP" --configfile ci-nuget.config -clp:ErrorsOnly
+          dotnet build "$STARTUP" --no-restore -clp:ErrorsOnly
+
+      - name: Install dotnet-ef (version from csproj)
+        shell: bash
+        run: dotnet tool install --global dotnet-ef --version "$EF_VERSION"
+
+      - name: Capture migrations on drift
+        shell: bash
+        env:
+          PROJECT: ${{ inputs.project }}
+          CONTEXTS: ${{ inputs.contexts }}
+          MIGRATIONS_ROOT: ${{ inputs.migrations-root }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          changed=0
+          for ctx in $(echo "$CONTEXTS" | jq -r '.[]'); do
+            short="${ctx%Context}"
+            outdir="${MIGRATIONS_ROOT}/${short}"
+            echo "::group::${ctx} drift check"
+            if dotnet ef migrations has-pending-model-changes --no-build \
+                 --context "$ctx" --project "$PROJECT" --startup-project "$STARTUP"; then
+              echo "${ctx}: no pending model changes"
+            else
+              echo "${ctx}: drift detected — adding migration Auto_${RUN_NUMBER}"
+              dotnet ef migrations add "Auto_${RUN_NUMBER}" --no-build \
+                --context "$ctx" --project "$PROJECT" --startup-project "$STARTUP" \
+                --output-dir "$outdir"
+              changed=1
+            fi
+            echo "::endgroup::"
+          done
+          echo "CHANGED=${changed}" >> "$GITHUB_ENV"
+
+      - name: Commit & push captured migrations
+        if: ${{ env.CHANGED == '1' }}
+        shell: bash
+        env:
+          PROJECT: ${{ inputs.project }}
+          MIGRATIONS_ROOT: ${{ inputs.migrations-root }}
+        run: |
+          set -euo pipefail
+          case "$PROJECT" in
+            *.csproj) proj_dir=$(dirname "$PROJECT") ;;
+            *)        proj_dir="$PROJECT" ;;
+          esac
+          git config user.name "${{ inputs.git-user-name }}"
+          git config user.email "${{ inputs.git-user-email }}"
+          # Only the migrations folder (new migration files + updated snapshot).
+          # ci-nuget.config at the repo root is never staged.
+          git add "${proj_dir}/${MIGRATIONS_ROOT}"
+          if git diff --cached --quiet; then
+            echo "Nothing staged after add — skipping commit."
+          else
+            git commit -m "Capture EF migration [skip ci]"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
+
+      - name: Output head sha
+        id: result
+        shell: bash
+        run: echo "head-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"

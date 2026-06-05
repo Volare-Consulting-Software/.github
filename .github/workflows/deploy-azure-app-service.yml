@@ -1,0 +1,253 @@
+name: deploy-azure-app-service
+
+# Reusable deploy workflow for Volare .NET microservices on Azure App Service
+# (Web App for Containers, Linux). Pulls a pre-built image from ACR and deploys
+# it to the env-specific App Service. No slot swap — each env is its own App Service.
+#
+# Two entry paths, branching on whether `image-tag` is supplied:
+#
+#   1. Explicit / dispatch (image-tag set): deploy that exact tag to the
+#      specified environment. Used by manual rollbacks and staging/prod promotions.
+#
+#   2. Auto / workflow_run (image-tag empty): the caller wired this workflow to
+#      `on: workflow_run` after the build workflow. We check out the caller repo
+#      at the build's head SHA, read <Version> from the csproj, and compute
+#      image-tag = "<Version>.<workflow_run.run_number>" — same formula as
+#      build-dotnet-container-image.yml. Environment defaults to "dev".
+#
+# Two ways to address the target site (independent of entry path):
+#   a. Convention (preferred): pass `app-service-base` (e.g. "volare-backoffice") and
+#      this workflow derives the App Service name (`<base>-dev` / `<base>-staging`
+#      / `<base>`) and the resource group (`Dev` / `Staging` / `Prod`).
+#   b. Explicit: pass `app-service-name` + `resource-group`. Use when a service
+#      doesn't follow the convention.
+#
+# The caller is responsible for setting up GitHub Environments named `dev`,
+# `staging`, `production` with the desired protection rules (required reviewers
+# on `production`). This workflow's `environment:` keyword binds the job to that
+# environment so the gate fires.
+
+on:
+  workflow_call:
+    inputs:
+      api-name:
+        description: ".NET service name (also the ACR repository name). Example: Volare.Solutions.BackOffice.API"
+        required: true
+        type: string
+      image-name:
+        description: "ACR repository name. Defaults to api-name if omitted."
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "GitHub Environment to bind to (dev / staging / production). Empty for the auto path → defaults to 'dev'."
+        required: false
+        type: string
+        default: ""
+      app-service-base:
+        description: "Base App Service name (e.g. volare-backoffice). Resolves to <base>-dev / <base>-staging / <base> by environment. Mutually exclusive with app-service-name."
+        required: false
+        type: string
+        default: ""
+      app-service-name:
+        description: "Exact App Service name. Overrides app-service-base if both are set."
+        required: false
+        type: string
+        default: ""
+      resource-group:
+        description: "Azure resource group containing the App Service. Derived from environment (Dev/Staging/Prod) if omitted."
+        required: false
+        type: string
+        default: ""
+      image-tag:
+        description: "Image tag in ACR to deploy. Empty triggers the auto path (compute from csproj <Version> + workflow_run.run_number)."
+        required: false
+        type: string
+        default: ""
+      csproj-path:
+        description: "Path to the csproj used to read <Version> on the auto path. Defaults to <api-name>/<api-name>.csproj."
+        required: false
+        type: string
+        default: ""
+      acr-name:
+        description: "ACR registry hostname (e.g. <name>.azurecr.io). Required — no default."
+        required: true
+        type: string
+    secrets:
+      OIDC_CLIENT_ID:
+        required: true
+      OIDC_TENANT_ID:
+        required: true
+      OIDC_SUBSCRIPTION_ID:
+        required: true
+
+permissions:
+  contents: write   # `release edit` (Reinforce-Latest step) needs write
+  id-token: write
+
+jobs:
+  deploy:
+    # Allow:
+    #   workflow_dispatch (rollback / hotfix path, image-tag supplied by caller)
+    #   workflow_run from a successful main push (dev auto-deploy)
+    #   release: prereleased / released (staging / production promotion via Releases UI)
+    if: ${{
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') ||
+        (github.event_name == 'release' && (github.event.action == 'prereleased' || github.event.action == 'released'))
+      }}
+    runs-on: ubuntu-latest
+    # Resolve target environment from caller input OR from the triggering event:
+    #   inputs.environment (workflow_dispatch passes its choice through)
+    #     → use as-is
+    #   release: prereleased → staging
+    #   release: released    → production
+    #   everything else (workflow_run / empty) → dev
+    # The same expression is replicated in `concurrency.group` and in the
+    # `Resolve target` step's INPUT_ENV env var below so all three see the
+    # same effective env. `environment:` is a job-level keyword evaluated at
+    # job start — it cannot reference step outputs, hence the inline chain.
+    environment: ${{ inputs.environment != '' && inputs.environment || (github.event_name == 'release' && github.event.action == 'prereleased' && 'staging') || (github.event_name == 'release' && github.event.action == 'released' && 'production') || 'dev' }}
+    concurrency:
+      group: deploy-${{ inputs.api-name }}-${{ inputs.environment != '' && inputs.environment || (github.event_name == 'release' && github.event.action == 'prereleased' && 'staging') || (github.event_name == 'release' && github.event.action == 'released' && 'production') || 'dev' }}
+      cancel-in-progress: false
+    steps:
+      - name: Resolve target
+        id: target
+        env:
+          INPUT_ENV: ${{ inputs.environment != '' && inputs.environment || (github.event_name == 'release' && github.event.action == 'prereleased' && 'staging') || (github.event_name == 'release' && github.event.action == 'released' && 'production') || 'dev' }}
+          INPUT_BASE: ${{ inputs.app-service-base }}
+          INPUT_APP: ${{ inputs.app-service-name }}
+          INPUT_RG: ${{ inputs.resource-group }}
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
+          INPUT_API_NAME: ${{ inputs.api-name }}
+        run: |
+          set -euo pipefail
+          # App Service name: explicit input wins; otherwise derive from base.
+          if [ -n "$INPUT_APP" ]; then
+            app_name="$INPUT_APP"
+          elif [ -n "$INPUT_BASE" ]; then
+            case "$INPUT_ENV" in
+              dev|staging) app_name="${INPUT_BASE}-${INPUT_ENV}" ;;
+              production)  app_name="$INPUT_BASE" ;;
+              *) echo "Unknown environment: $INPUT_ENV" >&2; exit 1 ;;
+            esac
+          else
+            echo "Either app-service-name or app-service-base must be provided." >&2
+            exit 1
+          fi
+          # Resource group: explicit input wins; otherwise derive from env.
+          if [ -n "$INPUT_RG" ]; then
+            rg="$INPUT_RG"
+          else
+            case "$INPUT_ENV" in
+              dev)        rg="Dev" ;;
+              staging)    rg="Staging" ;;
+              production) rg="Prod" ;;
+              *) echo "Unknown environment: $INPUT_ENV" >&2; exit 1 ;;
+            esac
+          fi
+          # Image name: ACR repository paths are lowercase (Docker registry rule).
+          # build-dotnet-container-image.yml lowercases on push; mirror that on pull so
+          # App Service doesn't silently fall back to the cached previous image.
+          raw_name="${INPUT_IMAGE_NAME:-$INPUT_API_NAME}"
+          image_name=$(echo "$raw_name" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "app-name=$app_name"
+            echo "rg=$rg"
+            echo "image-name=$image_name"
+          } >> "$GITHUB_OUTPUT"
+          echo "Target: $app_name in RG $rg, image name $image_name"
+
+      # Only the workflow_run auto path needs to check out the caller repo
+      # (to read the csproj <Version>). Release events bring the tag in via
+      # github.event.release.tag_name; workflow_dispatch passes inputs.image-tag.
+      - name: Check out at build SHA (workflow_run path only)
+        if: ${{ inputs.image-tag == '' && github.event_name == 'workflow_run' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Resolve image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.image-tag }}
+          INPUT_CSPROJ: ${{ inputs.csproj-path }}
+          INPUT_API_NAME: ${{ inputs.api-name }}
+          BUILD_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Priority:
+          #   1. Caller passed image-tag explicitly (workflow_dispatch path).
+          #      Strip leading `v` so vX.Y.Z and X.Y.Z are both accepted.
+          #   2. Release event: derive from github.event.release.tag_name
+          #      (release-tag-name → image-tag is a 1:1 mapping with `v` stripped).
+          #   3. workflow_run auto path: read csproj <Version> and combine with
+          #      workflow_run.run_number — same formula as build-dotnet-container-image.yml.
+          if [ -n "$INPUT_TAG" ]; then
+            tag="${INPUT_TAG#v}"
+          elif [ "$EVENT" = "release" ] && [ -n "$RELEASE_TAG" ]; then
+            tag="${RELEASE_TAG#v}"
+          else
+            csproj="${INPUT_CSPROJ:-${INPUT_API_NAME}/${INPUT_API_NAME}.csproj}"
+            if [ ! -f "$csproj" ]; then
+              echo "csproj not found at $csproj" >&2
+              exit 1
+            fi
+            base=$(grep -oP '(?<=<Version>)[^<]+(?=</Version>)' "$csproj" | head -1 | tr -d '[:space:]')
+            if [ -z "$base" ]; then
+              echo "Could not read <Version> from $csproj" >&2
+              exit 1
+            fi
+            if [ -z "$BUILD_RUN_NUMBER" ]; then
+              echo "workflow_run.run_number unavailable — auto path requires workflow_run trigger." >&2
+              exit 1
+            fi
+            tag="${base}.${BUILD_RUN_NUMBER}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved image tag: $tag"
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.OIDC_CLIENT_ID }}
+          tenant-id: ${{ secrets.OIDC_TENANT_ID }}
+          subscription-id: ${{ secrets.OIDC_SUBSCRIPTION_ID }}
+
+      - name: Set container image on App Service
+        run: |
+          az webapp config container set \
+            --name "${{ steps.target.outputs.app-name }}" \
+            --resource-group "${{ steps.target.outputs.rg }}" \
+            --container-image-name "${{ inputs.acr-name }}/${{ steps.target.outputs.image-name }}:${{ steps.tag.outputs.tag }}"
+
+      - name: Restart App Service
+        run: |
+          az webapp restart \
+            --name "${{ steps.target.outputs.app-name }}" \
+            --resource-group "${{ steps.target.outputs.rg }}"
+
+      # No in-pipeline smoke test. Each App Service has healthCheckPath
+      # configured at the service level (`az webapp config set --generic-configurations
+      # '{"healthCheckPath":"/api/ping"}'`), so Azure probes the container
+      # continuously and auto-restarts unhealthy instances. That probe is free
+      # and ongoing — a one-shot curl loop here only duplicated it at the cost
+      # of ~6 minutes of billable runner time per deploy.
+
+      # On a successful prod deploy triggered by a release event, explicitly
+      # mark the release as "Latest". GitHub auto-marks the most recent
+      # non-prerelease release as Latest, but this guarantees the badge tracks
+      # what's actually in prod even when releases land out of chronological
+      # order (e.g., a hotfix promoted to prod before a later main build).
+      # Makes the Releases page's "Latest" badge a free "what's in prod" dashboard.
+      - name: Reinforce Latest release on prod deploy
+        if: ${{ inputs.environment == 'production' && success() && github.event_name == 'release' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.event.release.tag_name }}" \
+            --latest=true \
+            --repo "${{ github.repository }}"

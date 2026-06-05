@@ -1,0 +1,102 @@
+name: build-and-test
+description: |
+  Shared build + test phase for Volare .NET projects.
+  - Sets up the requested .NET SDK
+  - Writes a NuGet config that authenticates against GitHub Packages
+    (Volare-Consulting-Software) using the caller workflow's GITHUB_TOKEN
+  - Restores, builds, and tests the solution
+  - Uploads any TRX results
+
+  Caller is responsible for `actions/checkout@v4` and for declaring
+  `permissions: { contents: read, packages: read }` so the GITHUB_TOKEN
+  this action receives can read the org's GitHub Packages feed.
+
+inputs:
+  solution-path:
+    description: "Path to a .sln or .csproj. Empty = let dotnet auto-detect from the working directory."
+    required: false
+    default: ""
+  dotnet-version:
+    description: "Version range passed to actions/setup-dotnet."
+    required: false
+    default: "10.x"
+  build-configuration:
+    description: "MSBuild configuration."
+    required: false
+    default: "Release"
+  test-filter:
+    description: "Filter expression passed to dotnet test --filter."
+    required: false
+    default: "TestCategory!=IntegrationTest"
+  github-token:
+    description: "GITHUB_TOKEN of the caller workflow. Used to authenticate against the Volare-Consulting-Software GitHub Packages feed."
+    required: true
+  skip-tests:
+    description: "When true, skip the dotnet test step (and its TRX upload). Build/restore still run. Intended for main-push builds where tests already ran on the PR."
+    required: false
+    type: boolean
+    default: false
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+
+    - name: Configure NuGet (GitHub Packages)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        cat > ci-nuget.config <<'EOF'
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <packageSources>
+            <clear />
+            <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+            <add key="volare" value="https://nuget.pkg.github.com/Volare-Consulting-Software/index.json" />
+          </packageSources>
+          <packageSourceCredentials>
+            <volare>
+              <add key="Username" value="github-actions" />
+              <add key="ClearTextPassword" value="__GH_TOKEN__" />
+            </volare>
+          </packageSourceCredentials>
+        </configuration>
+        EOF
+        sed -i "s|__GH_TOKEN__|${GH_TOKEN}|" ci-nuget.config
+
+    # `--verbosity quiet` doesn't silence build warnings — the MSBuild console
+    # logger emits them through a separate path. `-clp:ErrorsOnly` is the
+    # ConsoleLoggerParameter that genuinely hides warnings (and the summary).
+    - name: Restore
+      shell: bash
+      run: dotnet restore ${{ inputs.solution-path }} --configfile ci-nuget.config -clp:ErrorsOnly
+
+    - name: Build
+      shell: bash
+      env:
+        BuildConfiguration: ${{ inputs.build-configuration }}
+      run: dotnet build ${{ inputs.solution-path }} --configuration "$BuildConfiguration" --no-restore -clp:ErrorsOnly
+
+    - name: Test
+      if: inputs.skip-tests != 'true'
+      shell: bash
+      env:
+        BuildConfiguration: ${{ inputs.build-configuration }}
+      run: |
+        dotnet test ${{ inputs.solution-path }} \
+          --configuration "$BuildConfiguration" \
+          --no-build \
+          --filter "${{ inputs.test-filter }}" \
+          --logger "console;verbosity=normal" \
+          --logger "trx;LogFileName=test-results.trx"
+
+    - name: Upload test results
+      if: always() && inputs.skip-tests != 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: '**/TestResults/*.trx'
+        if-no-files-found: ignore

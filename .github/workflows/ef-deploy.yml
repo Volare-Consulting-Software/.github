@@ -1,0 +1,150 @@
+name: ef-deploy
+
+# Reusable workflow that applies EF Core migrations to a database when a release
+# is published. For each context it generates an idempotent SQL script from the
+# released source (offline — no DB connection), uploads it as an artifact for
+# audit, then applies it via azure/sql-action using the DB_CONNECTION_STRING
+# secret. Idempotent scripts are safe to re-run, so re-publishing a release is a
+# no-op against an already-migrated database.
+#
+# `environment` (default production) scopes the run to a GitHub Environment so
+# DB_CONNECTION_STRING resolves to that environment's secret. The target SQL
+# Server must allow the GitHub-hosted runner through its firewall. The dotnet-ef
+# tool version is taken from the project's EF Core package version.
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: "EF migrations project (directory or .csproj)."
+        required: true
+        type: string
+      startup-project:
+        description: "EF startup project (must reference Microsoft.EntityFrameworkCore.Design). Optional — defaults to `project` when the migrations project is self-startup."
+        required: false
+        type: string
+        default: ""
+      contexts:
+        description: "JSON array of DbContext names to script + apply, e.g. [\"BackOfficeContext\"]."
+        required: true
+        type: string
+      checkout-ref:
+        description: "Git ref to script from — the published release tag, so the released migrations are present."
+        required: false
+        type: string
+        default: ""
+      environment-name:
+        description: "GitHub Environment whose DB_CONNECTION_STRING secret to use."
+        required: false
+        type: string
+        default: "production"
+      dotnet-version:
+        description: "Version range passed to actions/setup-dotnet."
+        required: false
+        type: string
+        default: "10.x"
+    secrets:
+      DB_CONNECTION_STRING:
+        description: "Connection string for the target database. Provide via the GitHub Environment named by environment-name."
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  ef-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment-name }}
+    strategy:
+      # One job per context; each generates + applies its own idempotent script.
+      matrix:
+        context: ${{ fromJSON(inputs.contexts) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout-ref }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Configure NuGet (GitHub Packages)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > ci-nuget.config <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+              <add key="volare" value="https://nuget.pkg.github.com/Volare-Consulting-Software/index.json" />
+            </packageSources>
+            <packageSourceCredentials>
+              <volare>
+                <add key="Username" value="github-actions" />
+                <add key="ClearTextPassword" value="__GH_TOKEN__" />
+              </volare>
+            </packageSourceCredentials>
+          </configuration>
+          EOF
+          sed -i "s|__GH_TOKEN__|${GH_TOKEN}|" ci-nuget.config
+
+      - name: Resolve startup project & EF version
+        shell: bash
+        env:
+          PROJECT: ${{ inputs.project }}
+          STARTUP_INPUT: ${{ inputs.startup-project }}
+        run: |
+          set -euo pipefail
+          startup="${STARTUP_INPUT:-$PROJECT}"
+          echo "STARTUP=${startup}" >> "$GITHUB_ENV"
+          case "$PROJECT" in
+            *.csproj) csproj="$PROJECT" ;;
+            *)        csproj=$(ls "$PROJECT"/*.csproj | head -1) ;;
+          esac
+          ef_ver=$(grep -oP 'Microsoft\.EntityFrameworkCore\.(Design|Tools)"[^>]*Version="\K[^"]+' "$csproj" | head -1)
+          if [ -z "$ef_ver" ]; then
+            echo "Could not determine EF Core version from $csproj" >&2; exit 1
+          fi
+          echo "EF_VERSION=${ef_ver}" >> "$GITHUB_ENV"
+
+      - name: Restore & build (Debug, matches ef --no-build)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore "$STARTUP" --configfile ci-nuget.config -clp:ErrorsOnly
+          dotnet build "$STARTUP" --no-restore -clp:ErrorsOnly
+
+      - name: Install dotnet-ef (version from csproj)
+        shell: bash
+        run: dotnet tool install --global dotnet-ef --version "$EF_VERSION"
+
+      - name: Generate idempotent script
+        shell: bash
+        env:
+          CONTEXT: ${{ matrix.context }}
+          PROJECT: ${{ inputs.project }}
+        run: |
+          set -euo pipefail
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          mkdir -p scripts
+          dotnet ef migrations script --idempotent --no-build \
+            --context "$CONTEXT" --project "$PROJECT" --startup-project "$STARTUP" \
+            -o "scripts/${CONTEXT}.sql"
+          echo "Generated scripts/${CONTEXT}.sql"
+
+      - name: Upload migration script (audit)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ef-migration-script-${{ matrix.context }}
+          path: scripts/${{ matrix.context }}.sql
+          if-no-files-found: error
+
+      - name: Apply idempotent script to database
+        uses: azure/sql-action@v2
+        with:
+          connection-string: ${{ secrets.DB_CONNECTION_STRING }}
+          path: scripts/${{ matrix.context }}.sql
