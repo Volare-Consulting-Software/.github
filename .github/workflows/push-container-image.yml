@@ -1,0 +1,266 @@
+name: push-container-image
+
+# Reusable workflow that publishes a container image to GitHub Container
+# Registry (GHCR). Two modes, selected by whether `source-tag` is provided:
+#
+#   BUILD   (source-tag empty) -> builds the image from `dockerfile` and pushes
+#                                 the computed tag(s): an immutable version tag
+#                                 (`version` input, else the run number) and/or
+#                                 :latest, per include-version-tag/include-latest-tag.
+#   PROMOTE (source-tag set)   -> does NOT build. Re-tags the already-pushed
+#                                 <ref>:<source-tag> image to each of `dest-tags`
+#                                 (default :latest) registry-side via
+#                                 `docker buildx imagetools create` (no layer pull,
+#                                 preserves multi-arch). A leading `v` on source-tag
+#                                 is stripped so a Release tag (v1.2.3) maps to 1.2.3.
+#
+# Lives in the PUBLIC Volare-Consulting-Software/.github repo; self-contained
+# (no dependency on the private Volare.Build repo). GHCR only — auth uses the
+# caller run's GITHUB_TOKEN with `packages: write`.
+#
+# Typical use: a release workflow calls this in PROMOTE mode to point :latest (or
+# an environment tag) at the image built by build-node-container-image.yml.
+#
+# Example caller (BUILD on tag):
+#   jobs:
+#     push:
+#       uses: Volare-Consulting-Software/.github/.github/workflows/push-container-image.yml@main
+#       permissions: { contents: read, packages: write }
+#       with:
+#         version: ${{ github.ref_name }}
+#         include-latest-tag: true
+#
+# Example caller (PROMOTE on GitHub Release):
+#   jobs:
+#     promote:
+#       uses: Volare-Consulting-Software/.github/.github/workflows/push-container-image.yml@main
+#       permissions: { contents: read, packages: write }
+#       with:
+#         source-tag: ${{ github.event.release.tag_name }}   # vX.Y.Z -> X.Y.Z
+#         dest-tags: latest
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Image repository name (final path segment). If omitted, derived from the caller repo's name. Always lowercased before push."
+        required: false
+        type: string
+        default: ""
+      image-namespace:
+        description: "Path segment between host and image name. Defaults to the repo owner."
+        required: false
+        type: string
+        default: ""
+      registry-host:
+        description: "Registry hostname. Defaults to ghcr.io."
+        required: false
+        type: string
+        default: "ghcr.io"
+      dockerfile:
+        description: "BUILD mode: path to the Dockerfile."
+        required: false
+        type: string
+        default: "./Dockerfile"
+      build-context:
+        description: "BUILD mode: Docker build context."
+        required: false
+        type: string
+        default: "."
+      version:
+        description: "BUILD mode: explicit version tag (e.g. 1.2.3 or a ref name). A leading 'v' is stripped. Empty -> falls back to the run number."
+        required: false
+        type: string
+        default: ""
+      include-version-tag:
+        description: "BUILD mode: push the immutable version tag. Default true."
+        required: false
+        type: boolean
+        default: true
+      include-latest-tag:
+        description: "BUILD mode: also tag the image :latest. Default false."
+        required: false
+        type: boolean
+        default: false
+      source-tag:
+        description: "PROMOTE mode trigger. When set, no build happens; the existing <ref>:<source-tag> image is re-tagged to dest-tags. A leading 'v' is stripped."
+        required: false
+        type: string
+        default: ""
+      dest-tags:
+        description: "PROMOTE mode: whitespace/newline-separated destination tags to point at the source image. Defaults to 'latest'."
+        required: false
+        type: string
+        default: "latest"
+      runner-os:
+        description: "GitHub-hosted runner image. Default ubuntu-latest."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+    outputs:
+      image-tag-version:
+        description: "BUILD: the version tag pushed (version input or run number). PROMOTE: the source tag (leading v stripped)."
+        value: ${{ jobs.push.outputs.image-tag-version }}
+      image-name:
+        description: "The lowercased image repository name the image was pushed to."
+        value: ${{ jobs.push.outputs.image-name }}
+      image-ref:
+        description: "Primary full image reference (host/namespace/name:tag). BUILD -> version tag if present else :latest. PROMOTE -> first dest tag."
+        value: ${{ jobs.push.outputs.image-ref }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  push:
+    runs-on: ${{ inputs.runner-os }}
+    outputs:
+      image-tag-version: ${{ steps.image-meta.outputs.tag-version }}
+      image-name: ${{ steps.image-meta.outputs.image-name }}
+      image-ref: ${{ steps.image-meta.outputs.primary-ref }}
+    steps:
+      # Checkout is only needed for BUILD mode (Dockerfile + context). Harmless
+      # in PROMOTE mode.
+      - uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: image-meta
+        env:
+          HOST: ${{ inputs.registry-host }}
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
+          INPUT_NAMESPACE: ${{ inputs.image-namespace }}
+          INPUT_VERSION: ${{ inputs.version }}
+          OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          INCLUDE_VERSION_TAG: ${{ inputs.include-version-tag }}
+          INCLUDE_LATEST_TAG: ${{ inputs.include-latest-tag }}
+          SOURCE_TAG: ${{ inputs.source-tag }}
+          DEST_TAGS: ${{ inputs.dest-tags }}
+        run: |
+          set -euo pipefail
+
+          host="$HOST"
+
+          # Namespace: explicit input wins; defaults to the repo owner.
+          namespace="${INPUT_NAMESPACE:-$OWNER}"
+          namespace=$(echo "$namespace" | tr '[:upper:]' '[:lower:]')
+
+          # Image name: explicit input -> repo name, lowercased.
+          raw_name="${INPUT_IMAGE_NAME:-$REPO_NAME}"
+          image_name=$(echo "$raw_name" | tr '[:upper:]' '[:lower:]')
+          echo "image-name=$image_name" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$namespace" ]; then
+            ref="${host}/${namespace}/${image_name}"
+          else
+            ref="${host}/${image_name}"
+          fi
+          ref=$(echo "$ref" | tr '[:upper:]' '[:lower:]')
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$SOURCE_TAG" ]; then
+            # ---------- PROMOTE mode ----------
+            src="${SOURCE_TAG#v}"
+            echo "mode=promote" >> "$GITHUB_OUTPUT"
+            echo "tag-version=$src" >> "$GITHUB_OUTPUT"
+            echo "source-ref=${ref}:${src}" >> "$GITHUB_OUTPUT"
+
+            dests="${DEST_TAGS:-latest}"
+            primary_ref=""
+            dest_refs=""
+            for d in $dests; do
+              [ -z "$d" ] && continue
+              dest_refs="${dest_refs}${ref}:${d}"$'\n'
+              [ -z "$primary_ref" ] && primary_ref="${ref}:${d}"
+            done
+            if [ -z "$primary_ref" ]; then
+              echo "No dest-tags provided for promote." >&2; exit 1
+            fi
+            echo "primary-ref=$primary_ref" >> "$GITHUB_OUTPUT"
+            {
+              echo "dest-refs<<__REFS__"
+              printf '%s' "$dest_refs"
+              echo "__REFS__"
+            } >> "$GITHUB_OUTPUT"
+            echo "Promote source: ${ref}:${src}"
+            printf 'Promote dest tag(s):\n%s' "$dest_refs"
+          else
+            # ---------- BUILD mode ----------
+            echo "mode=build" >> "$GITHUB_OUTPUT"
+
+            # Version tag: explicit `version` input (leading v stripped) or run number.
+            version="${INPUT_VERSION#v}"
+            if [ -z "$version" ]; then
+              version="${RUN_NUMBER}"
+            fi
+            echo "tag-version=$version" >> "$GITHUB_OUTPUT"
+
+            tags=""
+            primary_ref=""
+            if [ "$INCLUDE_VERSION_TAG" = "true" ]; then
+              tags="${ref}:${version}"
+              primary_ref="${ref}:${version}"
+            fi
+            if [ "$INCLUDE_LATEST_TAG" = "true" ]; then
+              if [ -n "$tags" ]; then
+                tags="${tags}"$'\n'"${ref}:latest"
+              else
+                tags="${ref}:latest"
+              fi
+              if [ -z "$primary_ref" ]; then
+                primary_ref="${ref}:latest"
+              fi
+            fi
+            if [ -z "$tags" ]; then
+              echo "No image tags selected: enable include-version-tag and/or include-latest-tag." >&2
+              exit 1
+            fi
+            echo "primary-ref=$primary_ref" >> "$GITHUB_OUTPUT"
+            {
+              echo "tags<<__TAGS__"
+              echo "$tags"
+              echo "__TAGS__"
+            } >> "$GITHUB_OUTPUT"
+            printf 'Image target(s):\n%s\n' "$tags"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry-host }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        if: ${{ steps.image-meta.outputs.mode == 'build' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          # Expose GITHUB_TOKEN to the build so a Dockerfile installing private
+          # @volare-consulting-software packages can authenticate. Never lands
+          # in an image layer.
+          secrets: |
+            gh_token=${{ secrets.GITHUB_TOKEN }}
+          tags: ${{ steps.image-meta.outputs.tags }}
+
+      - name: Promote existing image to dest tag(s)
+        if: ${{ steps.image-meta.outputs.mode == 'promote' }}
+        env:
+          SOURCE_REF: ${{ steps.image-meta.outputs.source-ref }}
+          DEST_REFS: ${{ steps.image-meta.outputs.dest-refs }}
+        run: |
+          set -euo pipefail
+          # Registry-side retag: imagetools reads the source manifest and writes a
+          # new tag pointing at the same digest — no layer pull, preserves multi-arch.
+          while IFS= read -r dest; do
+            [ -z "$dest" ] && continue
+            echo "Tagging ${dest} -> ${SOURCE_REF}"
+            docker buildx imagetools create --tag "$dest" "$SOURCE_REF"
+          done <<< "$DEST_REFS"

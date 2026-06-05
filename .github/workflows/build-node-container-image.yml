@@ -1,0 +1,212 @@
+name: build-node-container-image
+
+# Reusable CI workflow for Volare Node/Next.js apps: install -> build -> test ->
+# containerize -> push to GitHub Container Registry (GHCR).
+#
+# Lives in the PUBLIC Volare-Consulting-Software/.github repo so any repo in the
+# org (public or private) can call it. Self-contained — no dependency on the
+# private Volare.Build repo.
+#
+# Auth: GHCR uses the caller run's GITHUB_TOKEN with `packages: write`. The same
+# token is exposed to the Docker build as a BuildKit secret named `gh_token`, so
+# a Dockerfile that installs private @volare-consulting-software packages from
+# npm.pkg.github.com can authenticate; it never lands in an image layer. Harmless
+# when unused.
+#
+# Tagging is git-ref driven:
+#   main push       -> main (floating) + main-<short-sha> (immutable)
+#   tag push v1.2.3 -> 1.2.3 + 1.2 + 1
+#   workflow_dispatch -> sha-<short-sha>
+#
+# Draft PRs are skipped (see the job-level `if:`). Callers should add
+# `ready_for_review` to their `pull_request: types:` so the build runs when a
+# draft is marked ready.
+#
+# Example caller (.github/workflows/build-push.yml in the app repo):
+#   on:
+#     push: { branches: [main], tags: ["v*.*.*"] }
+#     pull_request: { types: [opened, synchronize, reopened, ready_for_review] }
+#     workflow_dispatch:
+#   jobs:
+#     build-and-push:
+#       uses: Volare-Consulting-Software/.github/.github/workflows/build-node-container-image.yml@main
+#       permissions: { contents: read, packages: write }
+#       with:
+#         push-image: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Version range passed to actions/setup-node."
+        required: false
+        type: string
+        default: "20"
+      install-command:
+        description: "Dependency install command. Defaults to a clean, lockfile-faithful install."
+        required: false
+        type: string
+        default: "npm ci"
+      build-command:
+        description: "Build command run in the test job to verify the app compiles."
+        required: false
+        type: string
+        default: "npm run build"
+      test-command:
+        description: "Test command. Skipped entirely when `skip-tests` is true."
+        required: false
+        type: string
+        default: "npm test"
+      skip-tests:
+        description: "When true, skip the build+test job (only the container build runs). Use sparingly."
+        required: false
+        type: boolean
+        default: false
+      image-name:
+        description: "GHCR image name (owner/name). If omitted, derived from the caller repo's github.repository. Always lowercased before push (registry requirement)."
+        required: false
+        type: string
+        default: ""
+      dockerfile:
+        description: "Path to the Dockerfile relative to the repo root."
+        required: false
+        type: string
+        default: "./Dockerfile"
+      build-context:
+        description: "Docker build context path."
+        required: false
+        type: string
+        default: "."
+      push-image:
+        description: "Whether to push the image. Set true on push-to-main / tag pushes; false on PRs (build still runs to verify the Dockerfile, but no push)."
+        required: false
+        type: boolean
+        default: false
+      registry:
+        description: "Container registry hostname. Defaults to ghcr.io."
+        required: false
+        type: string
+        default: "ghcr.io"
+      runner-os:
+        description: "GitHub-hosted runner image. Default ubuntu-latest."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      include-latest-tag:
+        description: "When true, also tag main-branch builds with `:latest`. Default false — services running forward-only migrations on image pull shouldn't have a mutable production reference."
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      image-tags:
+        description: "Newline-separated list of full image refs pushed. Empty when push-image was false."
+        value: ${{ jobs.build-node-container-image.outputs.image-tags }}
+      image-name:
+        description: "The lowercased image repository name pushed to (without the tag suffix)."
+        value: ${{ jobs.build-node-container-image.outputs.image-name }}
+
+# Container builds are expensive; only the latest commit on a ref matters.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- build + test -------------------------------------------------------
+  test:
+    # Skip on draft PRs and when the caller opts out.
+    if: ${{ inputs.skip-tests != true && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: ${{ inputs.runner-os }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install
+        run: ${{ inputs.install-command }}
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - name: Test
+        run: ${{ inputs.test-command }}
+
+  # ---- containerize + push -----------------------------------------------
+  build-node-container-image:
+    # Run after tests, but still run when tests were skipped (the `if` keeps the
+    # container build alive even if `test` was skipped, via always() + result
+    # check). Draft PRs are skipped here too.
+    needs: test
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: ${{ inputs.runner-os }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tags: ${{ steps.tags.outputs.tags }}
+      image-name: ${{ steps.meta.outputs.image-name-lower }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image name (lowercased)
+        id: meta
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
+          REGISTRY: ${{ inputs.registry }}
+        run: |
+          # GHCR / Docker Registry v2 require the path component lowercase.
+          if [ -n "$INPUT_IMAGE_NAME" ]; then
+            raw="$INPUT_IMAGE_NAME"
+          else
+            raw="${{ github.repository }}"
+          fi
+          lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+          echo "image-name-lower=$lower" >> "$GITHUB_OUTPUT"
+          echo "Image target: ${REGISTRY}/${lower}"
+
+      - name: Log in to registry
+        if: ${{ inputs.push-image }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags
+        id: tags
+        if: ${{ inputs.push-image }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.registry }}/${{ steps.meta.outputs.image-name-lower }}
+          tags: |
+            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ inputs.include-latest-tag && github.ref == 'refs/heads/main' }}
+            type=sha,prefix=main-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Build (and push if enabled)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.dockerfile }}
+          push: ${{ inputs.push-image }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: ${{ steps.tags.outputs.labels }}
+          # Expose GITHUB_TOKEN to the build so a Dockerfile installing private
+          # @volare-consulting-software packages can authenticate. Mounted only
+          # for the RUN that uses it; never persisted in a layer.
+          secrets: |
+            gh_token=${{ secrets.GITHUB_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
