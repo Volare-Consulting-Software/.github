@@ -328,6 +328,11 @@ jobs:
           username: ${{ secrets.GITLAB_USERNAME }}
           password: ${{ secrets.GITLAB_TOKEN }}
 
+      # gha cache export requires the docker-container buildx driver.
+      - name: Set up Docker Buildx
+        if: ${{ steps.image-meta.outputs.mode == 'build' }}
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push image
         if: ${{ steps.image-meta.outputs.mode == 'build' }}
         uses: docker/build-push-action@v6
