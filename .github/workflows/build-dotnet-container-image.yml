@@ -1,13 +1,10 @@
 name: build-dotnet-container-image
 
-# Orchestrator for Volare .NET microservices: framework CI -> containerize ->
-# push -> release.
+# Orchestrator for Volare .NET microservices: framework CI -> image -> release.
 # - Delegates restore/build/test to the shared `build-and-test` composite action
-# - On non-PR runs (when push-image is true), delegates the docker build to the
-#   generic containerize-image.yml (image.tar workflow artifact), then the push
-#   to push-container-image.yml's LOAD mode, tagged with
-#   `<csproj-Version>.<github.run_number>` (or just `<github.run_number>` when
-#   no version-csproj is provided).
+# - On non-PR runs (when push-image is true), delegates the image build+push to
+#   push-container-image.yml, tagged with `<csproj-Version>.<github.run_number>`
+#   (or just `<github.run_number>` when no version-csproj is provided).
 #
 # Registry is selectable via the `registry` input:
 #   ghcr   (default) → ghcr.io/<owner>/<image>            (GITHUB_TOKEN auth)
@@ -20,9 +17,9 @@ name: build-dotnet-container-image
 #
 # Tagging: `include-version-tag` (default true) pushes the immutable
 # `<Version>.<run_number>` tag; `include-latest-tag` (default false) also pushes
-# `:latest`. At least one must be enabled when push-image is true. Producing the
-# image lives in containerize-image.yml; tag resolution + registry push live in
-# push-container-image.yml. This workflow computes the inputs, gates on
+# `:latest`. At least one must be enabled when push-image is true. All docker
+# and registry work (build + push + tag resolution) lives in
+# push-container-image.yml; this workflow computes the inputs, gates on
 # build-and-test, and drafts the release.
 #
 # Scope is the container image side only; nupkg publishing belongs to
@@ -185,28 +182,17 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           skip-tests: ${{ inputs.skip-tests }}
 
-  # Produce the image (generic docker build -> image.tar artifact). Gated on a
-  # green build-and-test and only when push-image is true (PRs build+test only,
-  # matching the previous behavior where no image work ran on PRs).
-  containerize:
+  # Build + push the image (BUILD mode: no source-tag). Gated on a green
+  # build-and-test and only when push-image is true (PRs build+test only).
+  push:
     needs: [build-and-test]
     if: ${{ inputs.push-image }}
-    uses: ./.github/workflows/containerize-image.yml
-    with:
-      image-name: ${{ inputs.image-name || inputs.api-name }}
-      dockerfile: ${{ inputs.dockerfile }}
-      runner-os: ${{ inputs.runner-os }}
-
-  # Push the exported image (LOAD mode). Only this leg knows the registry.
-  # Skipped automatically when containerize was skipped (no always()).
-  push:
-    needs: [containerize]
     uses: ./.github/workflows/push-container-image.yml
     with:
       api-name: ${{ inputs.api-name }}
       image-name: ${{ inputs.image-name }}
       version-csproj: ${{ inputs.version-csproj }}
-      image-artifact: ${{ needs.containerize.outputs.image-artifact }}
+      dockerfile: ${{ inputs.dockerfile }}
       registry: ${{ inputs.registry }}
       registry-host: ${{ inputs.registry-host }}
       image-namespace: ${{ inputs.image-namespace }}

@@ -1,23 +1,25 @@
 name: push-container-image
 
-# Reusable workflow that publishes a container image to a registry. This file
-# owns exactly one concern: DISTRIBUTING images (provider, host, name, tags).
-# It never builds — producing images belongs to containerize-image.yml. Two
-# modes, selected by which input is provided (exactly one is required):
+# Reusable workflow that builds and publishes a container image to a registry.
+# Producing and distributing the image live together here: framework CI
+# workflows (build-node-container-image / build-dotnet-container-image) stay
+# free of docker and registry concerns and delegate both to this file. It has
+# two modes, selected by whether `source-tag` is provided:
 #
-#   LOAD    (image-artifact set) → downloads the named workflow artifact
-#                                 (containing image.tar, exported by
-#                                 containerize-image.yml earlier in the same
-#                                 run), loads it, and re-tags/pushes it to the
-#                                 computed tag(s): the immutable
-#                                 <Version>.<run_number> version tag and/or
-#                                 :latest, per include-version-tag/include-latest-tag.
-#   PROMOTE (source-tag set)    → re-tags the already-pushed <ref>:<source-tag>
-#                                 image to each of `dest-tags` (default :latest)
-#                                 registry-side via `docker buildx imagetools
-#                                 create` (no layer pull). The leading `v` on
-#                                 source-tag is stripped so a GitHub Release tag
-#                                 (v1.2.3) maps to image tag 1.2.3.
+#   BUILD   (source-tag empty)  → builds the image from `dockerfile` and, when
+#                                 push-image is true, pushes the computed
+#                                 tag(s): the immutable <Version>.<run_number>
+#                                 version tag and/or :latest, per
+#                                 include-version-tag/include-latest-tag. With
+#                                 push-image false the build still runs — PR
+#                                 verification that the Dockerfile builds — but
+#                                 there is no registry login, tag, or push.
+#   PROMOTE (source-tag set)    → does NOT build. Re-tags the already-pushed
+#                                 <ref>:<source-tag> image to each of `dest-tags`
+#                                 (default :latest) registry-side via
+#                                 `docker buildx imagetools create` (no layer pull).
+#                                 The leading `v` on source-tag is stripped so a
+#                                 GitHub Release tag (v1.2.3) maps to image tag 1.2.3.
 #
 # ecr notes: auth is GitHub OIDC -> the IAM role in the OIDC_AWS_ROLE_ARN org
 # secret (callers need `id-token: write`). Unlike GHCR, ECR does NOT create
@@ -38,10 +40,25 @@ on:
         type: string
         default: ""
       version-csproj:
-        description: "LOAD mode: optional path to a .csproj with a <Version> element used to compute the version tag (<Version>.<run_number>). Empty / no <Version> → version tag falls back to <run_number>. Ignored in PROMOTE mode."
+        description: "BUILD mode: optional path to a .csproj with a <Version> element used to compute the version tag (<Version>.<run_number>). Empty / no <Version> → version tag falls back to <run_number>. Ignored in PROMOTE mode."
         required: false
         type: string
         default: ""
+      dockerfile:
+        description: "BUILD mode: path to the Dockerfile. Defaults to ./Dockerfile."
+        required: false
+        type: string
+        default: "./Dockerfile"
+      build-context:
+        description: "BUILD mode: Docker build context. Defaults to the repo root."
+        required: false
+        type: string
+        default: "."
+      push-image:
+        description: "BUILD mode: when false, build the image for verification only — no registry login, tags, or push (use on PR runs). Ignored in PROMOTE mode. Default true."
+        required: false
+        type: boolean
+        default: true
       registry:
         description: "Target registry provider: ghcr (default) | gitlab | acr | ecr."
         required: false
@@ -58,22 +75,17 @@ on:
         type: string
         default: ""
       include-version-tag:
-        description: "LOAD mode: push the immutable <Version>.<run_number> tag. Default true."
+        description: "BUILD mode: push the immutable <Version>.<run_number> tag. Default true."
         required: false
         type: boolean
         default: true
       include-latest-tag:
-        description: "LOAD mode: also tag the image :latest. Default false."
+        description: "BUILD mode: also tag the image :latest. Default false."
         required: false
         type: boolean
         default: false
       source-tag:
-        description: "PROMOTE mode trigger. When set, no build happens; the existing <ref>:<source-tag> image is re-tagged to dest-tags. A leading 'v' is stripped (Release tag vX → image tag X). Takes precedence over image-artifact."
-        required: false
-        type: string
-        default: ""
-      image-artifact:
-        description: "LOAD mode trigger. Name of a workflow artifact from an earlier job in the same run, containing image.tar (exported by containerize-image.yml). The image is loaded and pushed to the computed tag(s)."
+        description: "PROMOTE mode trigger. When set, no build happens; the existing <ref>:<source-tag> image is re-tagged to dest-tags. A leading 'v' is stripped (Release tag vX → image tag X)."
         required: false
         type: string
         default: ""
@@ -112,13 +124,13 @@ on:
         required: false
     outputs:
       image-tag-version:
-        description: "LOAD: <Version>.<run_number> (or <run_number>). PROMOTE: the source image tag (source-tag with any leading v stripped)."
+        description: "BUILD: <Version>.<run_number> (or <run_number>). PROMOTE: the source image tag (source-tag with any leading v stripped)."
         value: ${{ jobs.push.outputs.image-tag-version }}
       image-name:
         description: "The lowercased image repository name the image was pushed to."
         value: ${{ jobs.push.outputs.image-name }}
       image-ref:
-        description: "Primary full image reference (host/namespace/name:tag). LOAD → version tag if present else :latest. PROMOTE → first dest tag."
+        description: "Primary full image reference (host/namespace/name:tag). BUILD → version tag if present else :latest (empty when push-image was false). PROMOTE → first dest tag."
         value: ${{ jobs.push.outputs.image-ref }}
 
 permissions:
@@ -134,23 +146,24 @@ jobs:
       image-name: ${{ steps.image-meta.outputs.image-name }}
       image-ref: ${{ steps.image-meta.outputs.primary-ref }}
     steps:
-      # Checkout is only needed to read version-csproj in LOAD mode. Harmless
-      # otherwise.
+      # Checkout is only needed for BUILD mode (Dockerfile + context). Harmless
+      # in PROMOTE mode.
       - uses: actions/checkout@v4
 
       # ECR login runs BEFORE metadata is computed (unlike the other providers):
       # the registry hostname (<account>.dkr.ecr.<region>.amazonaws.com) is taken
       # from the login action's output, which keeps the AWS account id out of
       # this public file. Auth is GitHub OIDC -> IAM role; no stored AWS keys.
+      # Skipped on verification builds (push-image false), which touch no registry.
       - name: Configure AWS credentials
-        if: ${{ inputs.registry == 'ecr' }}
+        if: ${{ inputs.registry == 'ecr' && (inputs.push-image || inputs.source-tag != '') }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.OIDC_AWS_ROLE_ARN }}
           aws-region: ${{ inputs.aws-region }}
 
       - name: Log in to ECR
-        if: ${{ inputs.registry == 'ecr' }}
+        if: ${{ inputs.registry == 'ecr' && (inputs.push-image || inputs.source-tag != '') }}
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -172,19 +185,29 @@ jobs:
           INCLUDE_LATEST_TAG: ${{ inputs.include-latest-tag }}
           SOURCE_TAG: ${{ inputs.source-tag }}
           DEST_TAGS: ${{ inputs.dest-tags }}
-          IMAGE_ARTIFACT: ${{ inputs.image-artifact }}
+          PUSH_IMAGE: ${{ inputs.push-image }}
         run: |
           set -euo pipefail
 
           # Registry host: per-provider default, overridable via registry-host.
+          # Validation is deferred: verification builds (push-image false) never
+          # touch a registry, so a missing host only matters when pushing.
           case "$REGISTRY" in
             ghcr)   default_host="ghcr.io" ;;
             gitlab) default_host="registry.gitlab.com" ;;
-            acr)    default_host="${INPUT_ACR_NAME:?acr-name is required when registry is acr}" ;;
-            ecr)    default_host="${ECR_REGISTRY:?ECR login did not produce a registry host (is OIDC_AWS_ROLE_ARN set?)}" ;;
+            acr)    default_host="${INPUT_ACR_NAME:-}" ;;
+            ecr)    default_host="${ECR_REGISTRY:-}" ;;
             *) echo "Unknown registry '$REGISTRY' (expected ghcr|gitlab|acr|ecr)" >&2; exit 1 ;;
           esac
           host="${INPUT_REGISTRY_HOST:-$default_host}"
+          if [ -z "$host" ] && { [ -n "$SOURCE_TAG" ] || [ "$PUSH_IMAGE" = "true" ]; }; then
+            case "$REGISTRY" in
+              acr) echo "acr-name is required when registry is acr" >&2 ;;
+              ecr) echo "ECR login did not produce a registry host (is OIDC_AWS_ROLE_ARN set?)" >&2 ;;
+              *)   echo "No registry host resolved" >&2 ;;
+            esac
+            exit 1
+          fi
           echo "host=$host" >> "$GITHUB_OUTPUT"
 
           # Namespace: explicit input wins; ghcr defaults to repo owner; others none.
@@ -244,12 +267,8 @@ jobs:
             echo "Promote dest tag(s):"
             printf '%s' "$dest_refs"
           else
-            # ---------- LOAD mode ----------
-            if [ -z "$IMAGE_ARTIFACT" ]; then
-              echo "Provide image-artifact (LOAD) or source-tag (PROMOTE). Building belongs to containerize-image.yml." >&2
-              exit 1
-            fi
-            echo "mode=load" >> "$GITHUB_OUTPUT"
+            # ---------- BUILD mode ----------
+            echo "mode=build" >> "$GITHUB_OUTPUT"
 
             # Version tag: <csproj Version>.<run_number> or <run_number>.
             version=""
@@ -263,6 +282,14 @@ jobs:
               version="${RUN_NUMBER}"
             fi
             echo "tag-version=$version" >> "$GITHUB_OUTPUT"
+
+            if [ "$PUSH_IMAGE" != "true" ]; then
+              # Verification build: no registry, no tags, no push targets.
+              echo "primary-ref=" >> "$GITHUB_OUTPUT"
+              echo "tags=" >> "$GITHUB_OUTPUT"
+              echo "Verification build (push-image=false): image will not be tagged or pushed."
+              exit 0
+            fi
 
             tags=""
             primary_ref=""
@@ -295,7 +322,7 @@ jobs:
           fi
 
       - name: Log in to Azure
-        if: ${{ inputs.registry == 'acr' }}
+        if: ${{ inputs.registry == 'acr' && (inputs.push-image || inputs.source-tag != '') }}
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.OIDC_CLIENT_ID }}
@@ -303,11 +330,11 @@ jobs:
           subscription-id: ${{ secrets.OIDC_SUBSCRIPTION_ID }}
 
       - name: Log in to ACR
-        if: ${{ inputs.registry == 'acr' }}
+        if: ${{ inputs.registry == 'acr' && (inputs.push-image || inputs.source-tag != '') }}
         run: az acr login --name ${{ steps.image-meta.outputs.host }}
 
       - name: Log in to GHCR
-        if: ${{ inputs.registry == 'ghcr' }}
+        if: ${{ inputs.registry == 'ghcr' && (inputs.push-image || inputs.source-tag != '') }}
         uses: docker/login-action@v3
         with:
           registry: ${{ steps.image-meta.outputs.host }}
@@ -315,39 +342,29 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to GitLab Container Registry
-        if: ${{ inputs.registry == 'gitlab' }}
+        if: ${{ inputs.registry == 'gitlab' && (inputs.push-image || inputs.source-tag != '') }}
         uses: docker/login-action@v3
         with:
           registry: ${{ steps.image-meta.outputs.host }}
           username: ${{ secrets.GITLAB_USERNAME }}
           password: ${{ secrets.GITLAB_TOKEN }}
 
-      - name: Download prebuilt image artifact
-        if: ${{ steps.image-meta.outputs.mode == 'load' }}
-        uses: actions/download-artifact@v4
+      - name: Build and push image
+        if: ${{ steps.image-meta.outputs.mode == 'build' }}
+        uses: docker/build-push-action@v6
         with:
-          name: ${{ inputs.image-artifact }}
-          path: /tmp/image-artifact
-
-      - name: Load and push prebuilt image
-        if: ${{ steps.image-meta.outputs.mode == 'load' }}
-        env:
-          TAGS: ${{ steps.image-meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-          # docker load reports the tag baked into the tar by the build job
-          # ("Loaded image: <ref>"); that local ref is our retag source.
-          src=$(docker load -i /tmp/image-artifact/image.tar | sed -n 's/^Loaded image: //p' | head -1)
-          if [ -z "$src" ]; then
-            echo "image.tar contained no tagged image" >&2
-            exit 1
-          fi
-          while IFS= read -r tag; do
-            [ -z "$tag" ] && continue
-            echo "Pushing ${tag}"
-            docker tag "$src" "$tag"
-            docker push "$tag"
-          done <<< "$TAGS"
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.dockerfile }}
+          push: ${{ inputs.push-image }}
+          # Expose GITHUB_TOKEN as a BuildKit secret so a Dockerfile installing
+          # private @volare-consulting-software packages (nuget.pkg.github.com
+          # or npm.pkg.github.com) can authenticate. Mounted only for the RUN
+          # step that uses it; never lands in an image layer.
+          secrets: |
+            gh_token=${{ secrets.GITHUB_TOKEN }}
+          tags: ${{ steps.image-meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Promote existing image to dest tag(s)
         if: ${{ steps.image-meta.outputs.mode == 'promote' }}

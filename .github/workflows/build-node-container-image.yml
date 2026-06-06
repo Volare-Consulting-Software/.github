@@ -1,41 +1,35 @@
 name: build-node-container-image
 
 # Orchestrator for Volare Node/Next.js apps: framework CI (install -> build ->
-# test) followed by the generic containerize-image.yml, which exports the
-# built image as a workflow artifact (image.tar).
+# test) followed by delegation to push-container-image.yml, which owns all
+# docker and registry work (build, login, tag, push).
 #
 # Lives in the PUBLIC Volare-Consulting-Software/.github repo so any repo in
 # the org (public or private) can call it. Self-contained — no dependency on
 # the private Volare.Build repo.
 #
-# Only the test job here is node-specific. Containerization is delegated to
-# containerize-image.yml, and nothing in this pipeline knows registries exist:
-# a downstream push-container-image.yml job in the caller loads the exported
-# artifact and owns every registry decision (provider, host, name, tags).
+# Only the test job here is node-specific; this file contains no docker or
+# registry steps. On PR runs (push-image false) the image job still runs as a
+# verification build — the Dockerfile must build — but nothing is tagged,
+# logged in to, or pushed.
 #
 # Draft PRs are skipped (see the job-level `if:`). Callers should add
 # `ready_for_review` to their `pull_request: types:` so the build runs when a
 # draft is marked ready.
 #
-# Example caller (.github/workflows/build-push.yml in the app repo) — build on
-# every PR/push, hand the image to push-container-image on main:
+# Example caller (.github/workflows/build-push.yml in the app repo):
 #   on:
 #     push: { branches: [main] }
 #     pull_request: { types: [opened, synchronize, reopened, ready_for_review] }
 #   jobs:
-#     build:
+#     build-and-push:
 #       uses: Volare-Consulting-Software/.github/.github/workflows/build-node-container-image.yml@main
-#       permissions: { contents: read, packages: read }
-#     push:
-#       needs: build
-#       if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-#       uses: Volare-Consulting-Software/.github/.github/workflows/push-container-image.yml@main
 #       permissions: { contents: read, packages: write, id-token: write }
 #       secrets: inherit
 #       with:
 #         registry: ecr                  # or ghcr | gitlab | acr
 #         image-name: my-ecr-repo-name   # for ecr: must match an EXISTING repository
-#         image-artifact: ${{ needs.build.outputs.image-artifact }}
+#         push-image: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 on:
   workflow_call:
@@ -61,12 +55,12 @@ on:
         type: string
         default: "npm test"
       skip-tests:
-        description: "When true, skip the build+test job (only the container build runs). Use sparingly."
+        description: "When true, skip the build+test job (only the image job runs). Use sparingly."
         required: false
         type: boolean
         default: false
       image-name:
-        description: "Name used in the local tag inside the exported tar. If omitted, derived from the caller repo's github.repository. Always lowercased. The registry-facing name is chosen by the downstream push workflow, not here."
+        description: "Image repository name (final path segment). If omitted, derived from the caller repo's name. Always lowercased before push."
         required: false
         type: string
         default: ""
@@ -80,26 +74,69 @@ on:
         required: false
         type: string
         default: "."
-      image-artifact:
-        description: "Name of the workflow artifact the image tar is uploaded under. Feed the same name to push-container-image's image-artifact input."
+      push-image:
+        description: "Whether to push the image. Set true on push-to-main; false on PRs (the image still builds to verify the Dockerfile, but no push)."
+        required: false
+        type: boolean
+        default: false
+      registry:
+        description: "Target registry provider: ghcr (default) | gitlab | acr | ecr."
         required: false
         type: string
-        default: "container-image"
+        default: "ghcr"
+      registry-host:
+        description: "Override the registry hostname. Defaults per provider: ghcr.io / registry.gitlab.com / acr-name."
+        required: false
+        type: string
+        default: ""
+      image-namespace:
+        description: "Path segment between host and image name. Defaults: ghcr → repo owner; acr/ecr → none; gitlab → must be supplied."
+        required: false
+        type: string
+        default: ""
+      include-version-tag:
+        description: "Push the immutable <run_number> version tag. Default true."
+        required: false
+        type: boolean
+        default: true
+      include-latest-tag:
+        description: "Also tag the image :latest. Default false."
+        required: false
+        type: boolean
+        default: false
+      acr-name:
+        description: "ACR registry hostname (used only when registry: acr and registry-host is empty). Required when registry is acr (no default)."
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        description: "AWS region of the ECR registry (used only when registry: ecr)."
+        required: false
+        type: string
+        default: "us-east-1"
       runner-os:
         description: "GitHub-hosted runner image. Default ubuntu-latest."
         required: false
         type: string
         default: "ubuntu-latest"
+    secrets:
+      OIDC_AWS_ROLE_ARN:
+        description: "IAM role ARN assumed via GitHub OIDC for ECR pushes. Required when registry is ecr and push-image is true."
+        required: false
+      GITLAB_USERNAME:
+        required: false
+      GITLAB_TOKEN:
+        required: false
     outputs:
-      image-artifact:
-        description: "Name of the uploaded workflow artifact containing image.tar."
-        value: ${{ jobs.containerize.outputs.image-artifact }}
-      exported-image-ref:
-        description: "Local image reference the tar's image is tagged with."
-        value: ${{ jobs.containerize.outputs.exported-image-ref }}
+      image-tag-version:
+        description: "The version tag pushed: <run_number> (empty when push-image was false)."
+        value: ${{ jobs.image.outputs.image-tag-version }}
       image-name:
-        description: "The lowercased image name used in the local ref."
-        value: ${{ jobs.containerize.outputs.image-name }}
+        description: "The lowercased image repository name the image was pushed to."
+        value: ${{ jobs.image.outputs.image-name }}
+      image-ref:
+        description: "Primary full image reference pushed (host/namespace/name:tag). Empty when push-image was false."
+        value: ${{ jobs.image.outputs.image-ref }}
 
 # Container builds are expensive; only the latest commit on a ref matters.
 concurrency:
@@ -132,20 +169,25 @@ jobs:
       - name: Test
         run: ${{ inputs.test-command }}
 
-  # ---- containerize + export (generic, delegated) ---------------------------
-  containerize:
+  # ---- containerize + push (delegated; all docker/registry work) -----------
+  image:
     # Run after tests, but still run when tests were skipped (the `if` keeps the
-    # container build alive even if `test` was skipped, via always() + result
+    # image build alive even if `test` was skipped, via always() + result
     # check). Draft PRs are skipped here too.
     needs: test
     if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
-    uses: ./.github/workflows/containerize-image.yml
-    permissions:
-      contents: read
-      packages: read
+    uses: ./.github/workflows/push-container-image.yml
     with:
       image-name: ${{ inputs.image-name }}
       dockerfile: ${{ inputs.dockerfile }}
       build-context: ${{ inputs.build-context }}
-      image-artifact: ${{ inputs.image-artifact }}
+      push-image: ${{ inputs.push-image }}
+      registry: ${{ inputs.registry }}
+      registry-host: ${{ inputs.registry-host }}
+      image-namespace: ${{ inputs.image-namespace }}
+      include-version-tag: ${{ inputs.include-version-tag }}
+      include-latest-tag: ${{ inputs.include-latest-tag }}
+      acr-name: ${{ inputs.acr-name }}
+      aws-region: ${{ inputs.aws-region }}
       runner-os: ${{ inputs.runner-os }}
+    secrets: inherit
