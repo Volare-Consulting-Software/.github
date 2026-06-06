@@ -1,8 +1,9 @@
-name: build-node-container-image
+name: build-node
 
-# Orchestrator for Volare Node/Next.js apps: framework CI (install -> build ->
-# test) followed by delegation to push-container-image.yml, which owns all
-# docker and registry work (build, login, tag, push).
+# Orchestrator for Volare Node/Next.js apps: framework CI (the
+# node-build-and-test composite action: install -> build -> test) followed by
+# delegation to push-container-image.yml, which owns all docker and registry
+# work (build, login, tag, push). Mirrors build-dotnet.yml.
 #
 # Lives in the PUBLIC Volare-Consulting-Software/.github repo so any repo in
 # the org (public or private) can call it. Self-contained — no dependency on
@@ -23,7 +24,7 @@ name: build-node-container-image
 #     pull_request: { types: [opened, synchronize, reopened, ready_for_review] }
 #   jobs:
 #     build-and-push:
-#       uses: Volare-Consulting-Software/.github/.github/workflows/build-node-container-image.yml@main
+#       uses: Volare-Consulting-Software/.github/.github/workflows/build-node.yml@main
 #       permissions: { contents: read, packages: write, id-token: write }
 #       secrets: inherit
 #       with:
@@ -155,19 +156,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Build & test
+        uses: Volare-Consulting-Software/.github/.github/actions/node-build-and-test@main
         with:
           node-version: ${{ inputs.node-version }}
-          cache: npm
-
-      - name: Install
-        run: ${{ inputs.install-command }}
-
-      - name: Build
-        run: ${{ inputs.build-command }}
-
-      - name: Test
-        run: ${{ inputs.test-command }}
+          install-command: ${{ inputs.install-command }}
+          build-command: ${{ inputs.build-command }}
+          test-command: ${{ inputs.test-command }}
 
   # ---- containerize + push (delegated; all docker/registry work) -----------
   image:

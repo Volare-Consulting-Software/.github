@@ -15,7 +15,7 @@ name: deploy-azure-function-app
 #      `on: workflow_run` after the build workflow. We check out the caller repo
 #      at the build's head SHA, read <Version> from the csproj, and compute
 #      image-tag = "<Version>.<workflow_run.run_number>" — same formula as
-#      build-dotnet-container-image.yml. Environment defaults to "dev".
+#      build-dotnet.yml. Environment defaults to "dev".
 #
 # Two ways to address the target Function App (independent of entry path):
 #   a. Convention (preferred): pass `app-name-base` (e.g. "Volare-Functions") and
@@ -160,7 +160,7 @@ jobs:
             esac
           fi
           # Image name: ACR repository paths are lowercase (Docker registry rule).
-          # build-dotnet-container-image.yml lowercases on push; mirror that on pull so
+          # build-dotnet.yml lowercases on push; mirror that on pull so
           # the Function App doesn't silently fall back to a cached previous image.
           raw_name="${INPUT_IMAGE_NAME:-$INPUT_API_NAME}"
           image_name=$(echo "$raw_name" | tr '[:upper:]' '[:lower:]')
@@ -197,7 +197,7 @@ jobs:
           #   2. Release event: derive from github.event.release.tag_name
           #      (release-tag-name → image-tag is a 1:1 mapping with `v` stripped).
           #   3. workflow_run auto path: read csproj <Version> and combine with
-          #      workflow_run.run_number — same formula as build-dotnet-container-image.yml.
+          #      workflow_run.run_number — same formula as build-dotnet.yml.
           if [ -n "$INPUT_TAG" ]; then
             tag="${INPUT_TAG#v}"
           elif [ "$EVENT" = "release" ] && [ -n "$RELEASE_TAG" ]; then

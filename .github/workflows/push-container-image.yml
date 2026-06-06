@@ -2,7 +2,7 @@ name: push-container-image
 
 # Reusable workflow that builds and publishes a container image to a registry.
 # Producing and distributing the image live together here: framework CI
-# workflows (build-node-container-image / build-dotnet-container-image) stay
+# workflows (build-node / build-dotnet) stay
 # free of docker and registry concerns and delegate both to this file. It has
 # two modes, selected by whether `source-tag` is provided:
 #

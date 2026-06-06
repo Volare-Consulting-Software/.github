@@ -1,4 +1,4 @@
-name: build-dotnet-container-image
+name: build-dotnet
 
 # Orchestrator for Volare .NET microservices: framework CI -> image -> release.
 # - Delegates restore/build/test to the shared `build-and-test` composite action
@@ -173,7 +173,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build & test
-        uses: Volare-Consulting-Software/.github/.github/actions/build-and-test@main
+        uses: Volare-Consulting-Software/.github/.github/actions/dotnet-build-and-test@main
         with:
           solution-path: ${{ inputs.solution-path }}
           dotnet-version: ${{ inputs.dotnet-version }}
