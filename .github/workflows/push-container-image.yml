@@ -1,12 +1,20 @@
 name: push-container-image
 
-# Reusable workflow that publishes a container image to a registry. It has two
-# modes, selected by whether `source-tag` is provided:
+# Reusable workflow that publishes a container image to a registry. It has
+# three modes, selected by `source-tag` / `image-artifact`:
 #
-#   BUILD   (source-tag empty)  → builds the image from `dockerfile` and pushes
+#   BUILD   (source-tag and image-artifact empty)
+#                               → builds the image from `dockerfile` and pushes
 #                                 the computed tag(s): the immutable
 #                                 <Version>.<run_number> version tag and/or
 #                                 :latest, per include-version-tag/include-latest-tag.
+#   LOAD    (image-artifact set) → does NOT build. Downloads the named workflow
+#                                 artifact (containing image.tar, e.g. exported by
+#                                 build-node-container-image's export-image-artifact),
+#                                 loads it, and re-tags/pushes it to the same
+#                                 computed tag(s) as BUILD. The build and push
+#                                 jobs stay decoupled: only this workflow knows
+#                                 which registry the image lands in.
 #   PROMOTE (source-tag set)    → does NOT build. Re-tags the already-pushed
 #                                 <ref>:<source-tag> image to each of `dest-tags`
 #                                 (default :latest) registry-side via
@@ -77,7 +85,12 @@ on:
         type: boolean
         default: false
       source-tag:
-        description: "PROMOTE mode trigger. When set, no build happens; the existing <ref>:<source-tag> image is re-tagged to dest-tags. A leading 'v' is stripped (Release tag vX → image tag X)."
+        description: "PROMOTE mode trigger. When set, no build happens; the existing <ref>:<source-tag> image is re-tagged to dest-tags. A leading 'v' is stripped (Release tag vX → image tag X). Takes precedence over image-artifact."
+        required: false
+        type: string
+        default: ""
+      image-artifact:
+        description: "LOAD mode trigger. Name of a workflow artifact from an earlier job in the same run, containing image.tar (e.g. build-node-container-image's export-image-artifact). The image is loaded and pushed to the computed tag(s); no build happens."
         required: false
         type: string
         default: ""
@@ -176,6 +189,7 @@ jobs:
           INCLUDE_LATEST_TAG: ${{ inputs.include-latest-tag }}
           SOURCE_TAG: ${{ inputs.source-tag }}
           DEST_TAGS: ${{ inputs.dest-tags }}
+          IMAGE_ARTIFACT: ${{ inputs.image-artifact }}
         run: |
           set -euo pipefail
 
@@ -247,8 +261,12 @@ jobs:
             echo "Promote dest tag(s):"
             printf '%s' "$dest_refs"
           else
-            # ---------- BUILD mode ----------
-            echo "mode=build" >> "$GITHUB_OUTPUT"
+            # ---------- BUILD / LOAD mode (same tag computation) ----------
+            if [ -n "$IMAGE_ARTIFACT" ]; then
+              echo "mode=load" >> "$GITHUB_OUTPUT"
+            else
+              echo "mode=build" >> "$GITHUB_OUTPUT"
+            fi
 
             # Version tag: <csproj Version>.<run_number> or <run_number>.
             version=""
@@ -320,6 +338,33 @@ jobs:
           registry: ${{ steps.image-meta.outputs.host }}
           username: ${{ secrets.GITLAB_USERNAME }}
           password: ${{ secrets.GITLAB_TOKEN }}
+
+      - name: Download prebuilt image artifact
+        if: ${{ steps.image-meta.outputs.mode == 'load' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.image-artifact }}
+          path: /tmp/image-artifact
+
+      - name: Load and push prebuilt image
+        if: ${{ steps.image-meta.outputs.mode == 'load' }}
+        env:
+          TAGS: ${{ steps.image-meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          # docker load reports the tag baked into the tar by the build job
+          # ("Loaded image: <ref>"); that local ref is our retag source.
+          src=$(docker load -i /tmp/image-artifact/image.tar | sed -n 's/^Loaded image: //p' | head -1)
+          if [ -z "$src" ]; then
+            echo "image.tar contained no tagged image" >&2
+            exit 1
+          fi
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Pushing ${tag}"
+            docker tag "$src" "$tag"
+            docker push "$tag"
+          done <<< "$TAGS"
 
       - name: Build and push image
         if: ${{ steps.image-meta.outputs.mode == 'build' }}

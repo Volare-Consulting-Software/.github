@@ -1,7 +1,7 @@
 name: build-node-container-image
 
 # Reusable CI workflow for Volare Node/Next.js apps: install -> build -> test ->
-# containerize -> push to GitHub Container Registry (GHCR) or Amazon ECR.
+# containerize -> push to GitHub Container Registry (GHCR).
 #
 # Lives in the PUBLIC Volare-Consulting-Software/.github repo so any repo in the
 # org (public or private) can call it. Self-contained — no dependency on the
@@ -13,14 +13,6 @@ name: build-node-container-image
 # npm.pkg.github.com can authenticate; it never lands in an image layer. Harmless
 # when unused.
 #
-# ECR (registry-provider: ecr): auth is GitHub OIDC -> the IAM role in the
-# OIDC_AWS_ROLE_ARN org secret — callers must grant `id-token: write`. The
-# registry hostname comes from the ECR login action's output at runtime, so no
-# AWS account id lives in this public file. Unlike GHCR, ECR does NOT create
-# repositories on first push: the repository must already exist and `image-name`
-# must be set to its name (the github.repository default contains the org
-# prefix, which won't match a typical ECR repository).
-#
 # Tagging is git-ref driven:
 #   main push       -> main (floating) + main-<short-sha> (immutable)
 #   tag push v1.2.3 -> 1.2.3 + 1.2 + 1
@@ -29,6 +21,11 @@ name: build-node-container-image
 # Draft PRs are skipped (see the job-level `if:`). Callers should add
 # `ready_for_review` to their `pull_request: types:` so the build runs when a
 # draft is marked ready.
+#
+# This workflow can also stay registry-agnostic entirely: set
+# `export-image-artifact` instead of `push-image` and the built image is saved
+# as a workflow artifact (image.tar) for a downstream push-container-image.yml
+# job to load and push — that workflow owns all registry decisions.
 #
 # Example caller (.github/workflows/build-push.yml in the app repo):
 #   on:
@@ -42,16 +39,23 @@ name: build-node-container-image
 #       with:
 #         push-image: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
 #
-# Same caller targeting ECR instead (note id-token and the inherited org secret):
+# Build-only caller handing the image to push-container-image (e.g. for ECR):
 #   jobs:
-#     build-and-push:
+#     build:
 #       uses: Volare-Consulting-Software/.github/.github/workflows/build-node-container-image.yml@main
+#       permissions: { contents: read, packages: read }
+#       with:
+#         export-image-artifact: app-image
+#     push:
+#       needs: build
+#       if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+#       uses: Volare-Consulting-Software/.github/.github/workflows/push-container-image.yml@main
 #       permissions: { contents: read, packages: write, id-token: write }
 #       secrets: inherit
 #       with:
-#         registry-provider: ecr
+#         registry: ecr
 #         image-name: my-ecr-repo-name   # must match an EXISTING ECR repository
-#         push-image: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+#         image-artifact: app-image
 
 on:
   workflow_call:
@@ -101,21 +105,16 @@ on:
         required: false
         type: boolean
         default: false
-      registry-provider:
-        description: "Registry provider: ghcr (default) | ecr. Selects the login mechanism and registry host."
+      export-image-artifact:
+        description: "When set, the built image is saved as a docker tar and uploaded as a workflow artifact with this name (containing image.tar) for a downstream push job to consume. Keeps this workflow registry-agnostic. Mutually exclusive with push-image."
         required: false
         type: string
-        default: "ghcr"
+        default: ""
       registry:
-        description: "Container registry hostname. Defaults to ghcr.io. Ignored when registry-provider is ecr (the host comes from the ECR login)."
+        description: "Container registry hostname. Defaults to ghcr.io."
         required: false
         type: string
         default: "ghcr.io"
-      aws-region:
-        description: "AWS region of the ECR registry (used only when registry-provider is ecr)."
-        required: false
-        type: string
-        default: "us-east-1"
       runner-os:
         description: "GitHub-hosted runner image. Default ubuntu-latest."
         required: false
@@ -126,10 +125,6 @@ on:
         required: false
         type: boolean
         default: false
-    secrets:
-      OIDC_AWS_ROLE_ARN:
-        description: "IAM role ARN assumed via GitHub OIDC for ECR pushes. Required when registry-provider is ecr."
-        required: false
     outputs:
       image-tags:
         description: "Newline-separated list of full image refs pushed. Empty when push-image was false."
@@ -137,6 +132,9 @@ on:
       image-name:
         description: "The lowercased image repository name pushed to (without the tag suffix)."
         value: ${{ jobs.build-node-container-image.outputs.image-name }}
+      exported-image-ref:
+        description: "Local image reference inside the exported artifact's image.tar. Set only when export-image-artifact was provided."
+        value: ${{ jobs.build-node-container-image.outputs.exported-image-ref }}
 
 # Container builds are expensive; only the latest commit on a ref matters.
 concurrency:
@@ -180,35 +178,19 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write   # aws-actions OIDC on the ecr path (no-op otherwise)
     outputs:
       image-tags: ${{ steps.tags.outputs.tags }}
       image-name: ${{ steps.meta.outputs.image-name-lower }}
+      exported-image-ref: ${{ steps.meta.outputs.local-ref }}
     steps:
       - uses: actions/checkout@v4
-
-      # ECR login runs before the registry host is resolved: the hostname
-      # (<account>.dkr.ecr.<region>.amazonaws.com) is taken from the login
-      # action's output, keeping the AWS account id out of this public file.
-      - name: Configure AWS credentials
-        if: ${{ inputs.push-image && inputs.registry-provider == 'ecr' }}
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.OIDC_AWS_ROLE_ARN }}
-          aws-region: ${{ inputs.aws-region }}
-
-      - name: Log in to Amazon ECR
-        if: ${{ inputs.push-image && inputs.registry-provider == 'ecr' }}
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Resolve image name (lowercased)
         id: meta
         env:
           INPUT_IMAGE_NAME: ${{ inputs.image-name }}
-          REGISTRY_PROVIDER: ${{ inputs.registry-provider }}
-          INPUT_REGISTRY: ${{ inputs.registry }}
-          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          REGISTRY: ${{ inputs.registry }}
+          EXPORT_ARTIFACT: ${{ inputs.export-image-artifact }}
           PUSH_IMAGE: ${{ inputs.push-image }}
         run: |
           # GHCR / Docker Registry v2 require the path component lowercase.
@@ -220,23 +202,23 @@ jobs:
           lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
           echo "image-name-lower=$lower" >> "$GITHUB_OUTPUT"
 
-          # Registry host: ECR's comes from the login output (empty on PR builds
-          # where push-image is false and login is skipped — harmless, since the
-          # tag computation that consumes it is skipped too).
-          if [ "$REGISTRY_PROVIDER" = "ecr" ]; then
-            host="$ECR_REGISTRY"
-            if [ "$PUSH_IMAGE" = "true" ] && [ -z "$host" ]; then
-              echo "ECR login did not produce a registry host (is OIDC_AWS_ROLE_ARN set?)" >&2
-              exit 1
-            fi
-          else
-            host="$INPUT_REGISTRY"
+          if [ -n "$EXPORT_ARTIFACT" ] && [ "$PUSH_IMAGE" = "true" ]; then
+            echo "push-image and export-image-artifact are mutually exclusive: export hands the image to a downstream push job." >&2
+            exit 1
           fi
-          echo "registry-host=$host" >> "$GITHUB_OUTPUT"
-          echo "Image target: ${host}/${lower}"
+
+          # Exported tars carry a deliberately registry-free local tag; the
+          # downstream push workflow decides where the image actually goes.
+          if [ -n "$EXPORT_ARTIFACT" ]; then
+            short_sha=$(echo "${{ github.sha }}" | cut -c1-7)
+            echo "local-ref=local/${lower}:${short_sha}" >> "$GITHUB_OUTPUT"
+            echo "Image target: artifact '${EXPORT_ARTIFACT}' (local/${lower}:${short_sha})"
+          else
+            echo "Image target: ${REGISTRY}/${lower}"
+          fi
 
       - name: Log in to registry
-        if: ${{ inputs.push-image && inputs.registry-provider != 'ecr' }}
+        if: ${{ inputs.push-image }}
         uses: docker/login-action@v3
         with:
           registry: ${{ inputs.registry }}
@@ -251,7 +233,7 @@ jobs:
         if: ${{ inputs.push-image }}
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.meta.outputs.registry-host }}/${{ steps.meta.outputs.image-name-lower }}
+          images: ${{ inputs.registry }}/${{ steps.meta.outputs.image-name-lower }}
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=latest,enable=${{ inputs.include-latest-tag && github.ref == 'refs/heads/main' }}
@@ -261,14 +243,16 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
 
-      - name: Build (and push if enabled)
+      - name: Build (and push or export if enabled)
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.build-context }}
           file: ${{ inputs.dockerfile }}
           push: ${{ inputs.push-image }}
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ steps.meta.outputs.local-ref || steps.tags.outputs.tags }}
           labels: ${{ steps.tags.outputs.labels }}
+          # When exporting, write the image to a tar instead of any registry.
+          outputs: ${{ inputs.export-image-artifact != '' && 'type=docker,dest=/tmp/image.tar' || '' }}
           # Expose GITHUB_TOKEN to the build so a Dockerfile installing private
           # @volare-consulting-software packages can authenticate. Mounted only
           # for the RUN that uses it; never persisted in a layer.
@@ -276,3 +260,14 @@ jobs:
             gh_token=${{ secrets.GITHUB_TOKEN }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Upload image artifact
+        if: ${{ inputs.export-image-artifact != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.export-image-artifact }}
+          path: /tmp/image.tar
+          if-no-files-found: error
+          # The artifact is a handoff to the push job in this same run, not an
+          # archive — keep retention minimal.
+          retention-days: 1
