@@ -64,7 +64,7 @@ jobs:
       head-sha: ${{ steps.result.outputs.head-sha }}
     steps:
       # fetch-depth: 0 + persisted token lets the commit below push back to the
-      # branch (mirrors build-npm-package.yml's version-bump pattern).
+      # branch (mirrors build-node-package.yml's version-bump pattern).
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

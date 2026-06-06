@@ -42,7 +42,7 @@ This `.github` repo isn't just an org profile — it's Volare's central library 
 | Area | Workflows | What they do |
 |---|---|---|
 | **.NET build & publish** | `dotnet-build-and-test` (action), `build-dotnet-package`, `push-container-image` | Restore/build/test via the composite action, then pack & publish NuGet to GitHub Packages, or containerize a microservice and push to GHCR / GitLab / ACR / ECR. |
-| **Node build & publish** | `node-build-and-test` (action), `build-npm-package`, `publish-npm-public` | Install/build/test Next.js apps via the composite action, containerize via `push-container-image`; publish internal npm packages to GitHub Packages, or open-source ones to the public npm registry. |
+| **Node build & publish** | `node-build-and-test` (action), `build-node-package`, `publish-npm-public` | Install/build/test Next.js apps via the composite action, containerize via `push-container-image`; publish internal npm packages to GitHub Packages, or open-source ones to the public npm registry. |
 | **Container plumbing** | `push-container-image` | One implementation for both building+pushing an image and promoting (registry-side re-tagging) an existing one across registries. |
 | **Azure deploy** | `deploy-azure-app-service`, `deploy-azure-function-app` | Pull a pre-built image from ACR and deploy it to the env-specific App Service / Function App via OIDC, gated through GitHub Environments (`dev` / `staging` / `production`). |
 | **Database (EF Core)** | `ef-capture-migration`, `ef-deploy` | Auto-capture migration drift on a push to main; generate and apply idempotent migration scripts on release. |
