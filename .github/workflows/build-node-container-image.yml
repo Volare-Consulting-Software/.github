@@ -1,51 +1,37 @@
 name: build-node-container-image
 
 # Reusable CI workflow for Volare Node/Next.js apps: install -> build -> test ->
-# containerize -> push to GitHub Container Registry (GHCR).
+# containerize -> export the image as a workflow artifact.
 #
 # Lives in the PUBLIC Volare-Consulting-Software/.github repo so any repo in the
 # org (public or private) can call it. Self-contained — no dependency on the
 # private Volare.Build repo.
 #
-# Auth: GHCR uses the caller run's GITHUB_TOKEN with `packages: write`. The same
-# token is exposed to the Docker build as a BuildKit secret named `gh_token`, so
-# a Dockerfile that installs private @volare-consulting-software packages from
-# npm.pkg.github.com can authenticate; it never lands in an image layer. Harmless
-# when unused.
+# This workflow is deliberately registry-agnostic: it never logs in to or
+# pushes to a container registry. Every run exports the built image as a
+# docker tar (image.tar) under the `image-artifact` workflow artifact, tagged
+# with a registry-free local ref. A downstream push-container-image.yml job in
+# the same run loads that artifact and owns every registry decision (provider,
+# host, name, tags).
 #
-# Tagging is git-ref driven:
-#   main push       -> main (floating) + main-<short-sha> (immutable)
-#   tag push v1.2.3 -> 1.2.3 + 1.2 + 1
-#   workflow_dispatch -> sha-<short-sha>
+# Auth: the caller run's GITHUB_TOKEN is exposed to the Docker build as a
+# BuildKit secret named `gh_token`, so a Dockerfile that installs private
+# @volare-consulting-software packages from npm.pkg.github.com can
+# authenticate; it never lands in an image layer. Harmless when unused.
 #
 # Draft PRs are skipped (see the job-level `if:`). Callers should add
 # `ready_for_review` to their `pull_request: types:` so the build runs when a
 # draft is marked ready.
 #
-# This workflow can also stay registry-agnostic entirely: set
-# `export-image-artifact` instead of `push-image` and the built image is saved
-# as a workflow artifact (image.tar) for a downstream push-container-image.yml
-# job to load and push — that workflow owns all registry decisions.
-#
-# Example caller (.github/workflows/build-push.yml in the app repo):
+# Example caller (.github/workflows/build-push.yml in the app repo) — build on
+# every PR/push, hand the image to push-container-image on main:
 #   on:
-#     push: { branches: [main], tags: ["v*.*.*"] }
+#     push: { branches: [main] }
 #     pull_request: { types: [opened, synchronize, reopened, ready_for_review] }
-#     workflow_dispatch:
-#   jobs:
-#     build-and-push:
-#       uses: Volare-Consulting-Software/.github/.github/workflows/build-node-container-image.yml@main
-#       permissions: { contents: read, packages: write }
-#       with:
-#         push-image: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
-#
-# Build-only caller handing the image to push-container-image (e.g. for ECR):
 #   jobs:
 #     build:
 #       uses: Volare-Consulting-Software/.github/.github/workflows/build-node-container-image.yml@main
 #       permissions: { contents: read, packages: read }
-#       with:
-#         export-image-artifact: app-image
 #     push:
 #       needs: build
 #       if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -53,9 +39,9 @@ name: build-node-container-image
 #       permissions: { contents: read, packages: write, id-token: write }
 #       secrets: inherit
 #       with:
-#         registry: ecr
-#         image-name: my-ecr-repo-name   # must match an EXISTING ECR repository
-#         image-artifact: app-image
+#         registry: ecr                  # or ghcr | gitlab | acr
+#         image-name: my-ecr-repo-name   # for ecr: must match an EXISTING repository
+#         image-artifact: ${{ needs.build.outputs.image-artifact }}
 
 on:
   workflow_call:
@@ -86,7 +72,7 @@ on:
         type: boolean
         default: false
       image-name:
-        description: "GHCR image name (owner/name). If omitted, derived from the caller repo's github.repository. Always lowercased before push (registry requirement)."
+        description: "Name used in the local tag inside the exported tar. If omitted, derived from the caller repo's github.repository. Always lowercased. The registry-facing name is chosen by the downstream push workflow, not here."
         required: false
         type: string
         default: ""
@@ -100,41 +86,26 @@ on:
         required: false
         type: string
         default: "."
-      push-image:
-        description: "Whether to push the image. Set true on push-to-main / tag pushes; false on PRs (build still runs to verify the Dockerfile, but no push)."
-        required: false
-        type: boolean
-        default: false
-      export-image-artifact:
-        description: "When set, the built image is saved as a docker tar and uploaded as a workflow artifact with this name (containing image.tar) for a downstream push job to consume. Keeps this workflow registry-agnostic. Mutually exclusive with push-image."
+      image-artifact:
+        description: "Name of the workflow artifact the image tar is uploaded under. Feed the same name to push-container-image's image-artifact input."
         required: false
         type: string
-        default: ""
-      registry:
-        description: "Container registry hostname. Defaults to ghcr.io."
-        required: false
-        type: string
-        default: "ghcr.io"
+        default: "container-image"
       runner-os:
         description: "GitHub-hosted runner image. Default ubuntu-latest."
         required: false
         type: string
         default: "ubuntu-latest"
-      include-latest-tag:
-        description: "When true, also tag main-branch builds with `:latest`. Default false — services running forward-only migrations on image pull shouldn't have a mutable production reference."
-        required: false
-        type: boolean
-        default: false
     outputs:
-      image-tags:
-        description: "Newline-separated list of full image refs pushed. Empty when push-image was false."
-        value: ${{ jobs.build-node-container-image.outputs.image-tags }}
-      image-name:
-        description: "The lowercased image repository name pushed to (without the tag suffix)."
-        value: ${{ jobs.build-node-container-image.outputs.image-name }}
+      image-artifact:
+        description: "Name of the uploaded workflow artifact containing image.tar."
+        value: ${{ jobs.build-node-container-image.outputs.image-artifact }}
       exported-image-ref:
-        description: "Local image reference inside the exported artifact's image.tar. Set only when export-image-artifact was provided."
+        description: "Local image reference the tar's image is tagged with."
         value: ${{ jobs.build-node-container-image.outputs.exported-image-ref }}
+      image-name:
+        description: "The lowercased image name used in the local ref."
+        value: ${{ jobs.build-node-container-image.outputs.image-name }}
 
 # Container builds are expensive; only the latest commit on a ref matters.
 concurrency:
@@ -167,7 +138,7 @@ jobs:
       - name: Test
         run: ${{ inputs.test-command }}
 
-  # ---- containerize + push -----------------------------------------------
+  # ---- containerize + export ----------------------------------------------
   build-node-container-image:
     # Run after tests, but still run when tests were skipped (the `if` keeps the
     # container build alive even if `test` was skipped, via always() + result
@@ -177,82 +148,46 @@ jobs:
     runs-on: ${{ inputs.runner-os }}
     permissions:
       contents: read
-      packages: write
+      packages: read
     outputs:
-      image-tags: ${{ steps.tags.outputs.tags }}
-      image-name: ${{ steps.meta.outputs.image-name-lower }}
+      image-artifact: ${{ steps.meta.outputs.artifact-name }}
       exported-image-ref: ${{ steps.meta.outputs.local-ref }}
+      image-name: ${{ steps.meta.outputs.image-name-lower }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve image name (lowercased)
+      - name: Resolve local image ref
         id: meta
         env:
           INPUT_IMAGE_NAME: ${{ inputs.image-name }}
-          REGISTRY: ${{ inputs.registry }}
-          EXPORT_ARTIFACT: ${{ inputs.export-image-artifact }}
-          PUSH_IMAGE: ${{ inputs.push-image }}
+          ARTIFACT_NAME: ${{ inputs.image-artifact }}
         run: |
-          # GHCR / Docker Registry v2 require the path component lowercase.
+          # Docker requires the path component lowercase.
           if [ -n "$INPUT_IMAGE_NAME" ]; then
             raw="$INPUT_IMAGE_NAME"
           else
             raw="${{ github.repository }}"
           fi
           lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
+          short_sha=$(echo "${{ github.sha }}" | cut -c1-7)
           echo "image-name-lower=$lower" >> "$GITHUB_OUTPUT"
-
-          if [ -n "$EXPORT_ARTIFACT" ] && [ "$PUSH_IMAGE" = "true" ]; then
-            echo "push-image and export-image-artifact are mutually exclusive: export hands the image to a downstream push job." >&2
-            exit 1
-          fi
-
-          # Exported tars carry a deliberately registry-free local tag; the
-          # downstream push workflow decides where the image actually goes.
-          if [ -n "$EXPORT_ARTIFACT" ]; then
-            short_sha=$(echo "${{ github.sha }}" | cut -c1-7)
-            echo "local-ref=local/${lower}:${short_sha}" >> "$GITHUB_OUTPUT"
-            echo "Image target: artifact '${EXPORT_ARTIFACT}' (local/${lower}:${short_sha})"
-          else
-            echo "Image target: ${REGISTRY}/${lower}"
-          fi
-
-      - name: Log in to registry
-        if: ${{ inputs.push-image }}
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ inputs.registry }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          echo "artifact-name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          # Registry-free on purpose: the downstream push workflow decides
+          # where the image actually goes.
+          echo "local-ref=local/${lower}:${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "Exporting local/${lower}:${short_sha} as artifact '${ARTIFACT_NAME}'"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compute image tags
-        id: tags
-        if: ${{ inputs.push-image }}
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ inputs.registry }}/${{ steps.meta.outputs.image-name-lower }}
-          tags: |
-            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
-            type=raw,value=latest,enable=${{ inputs.include-latest-tag && github.ref == 'refs/heads/main' }}
-            type=sha,prefix=main-,format=short,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short,enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-
-      - name: Build (and push or export if enabled)
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.build-context }}
           file: ${{ inputs.dockerfile }}
-          push: ${{ inputs.push-image }}
-          tags: ${{ steps.meta.outputs.local-ref || steps.tags.outputs.tags }}
-          labels: ${{ steps.tags.outputs.labels }}
-          # When exporting, write the image to a tar instead of any registry.
-          outputs: ${{ inputs.export-image-artifact != '' && 'type=docker,dest=/tmp/image.tar' || '' }}
+          tags: ${{ steps.meta.outputs.local-ref }}
+          # Write the image to a tar instead of any registry or daemon.
+          outputs: type=docker,dest=/tmp/image.tar
           # Expose GITHUB_TOKEN to the build so a Dockerfile installing private
           # @volare-consulting-software packages can authenticate. Mounted only
           # for the RUN that uses it; never persisted in a layer.
@@ -262,12 +197,11 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Upload image artifact
-        if: ${{ inputs.export-image-artifact != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.export-image-artifact }}
+          name: ${{ inputs.image-artifact }}
           path: /tmp/image.tar
           if-no-files-found: error
-          # The artifact is a handoff to the push job in this same run, not an
+          # The artifact is a handoff to the push job in the same run, not an
           # archive — keep retention minimal.
           retention-days: 1
