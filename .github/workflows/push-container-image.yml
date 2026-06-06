@@ -17,6 +17,11 @@ name: push-container-image
 # Registry selection, host/namespace/image-name resolution, and per-provider
 # login mirror build-dotnet-container-image.yml exactly, so both build and promote share
 # one implementation. build-dotnet-container-image.yml delegates its BUILD push here.
+#
+# ecr notes: auth is GitHub OIDC -> the IAM role in the OIDC_AWS_ROLE_ARN org
+# secret (callers need `id-token: write`). Unlike GHCR, ECR does NOT create
+# repositories on first push — the repository must already exist, and its name
+# must match the resolved image-name.
 
 on:
   workflow_call:
@@ -47,7 +52,7 @@ on:
         type: string
         default: "."
       registry:
-        description: "Target registry provider: ghcr (default) | gitlab | acr."
+        description: "Target registry provider: ghcr (default) | gitlab | acr | ecr."
         required: false
         type: string
         default: "ghcr"
@@ -86,6 +91,11 @@ on:
         required: false
         type: string
         default: ""
+      aws-region:
+        description: "AWS region of the ECR registry (used only when registry: ecr)."
+        required: false
+        type: string
+        default: "us-east-1"
       runner-os:
         description: "GitHub-hosted runner image. Default ubuntu-latest."
         required: false
@@ -97,6 +107,8 @@ on:
       OIDC_TENANT_ID:
         required: false
       OIDC_SUBSCRIPTION_ID:
+        required: false
+      OIDC_AWS_ROLE_ARN:
         required: false
       GITLAB_USERNAME:
         required: false
@@ -116,7 +128,7 @@ on:
 permissions:
   contents: read
   packages: write   # GHCR push
-  id-token: write   # azure/login OIDC on the acr path (no-op otherwise)
+  id-token: write   # azure/login (acr) and aws-actions (ecr) OIDC; no-op otherwise
 
 jobs:
   push:
@@ -130,12 +142,29 @@ jobs:
       # in PROMOTE mode.
       - uses: actions/checkout@v4
 
+      # ECR login runs BEFORE metadata is computed (unlike the other providers):
+      # the registry hostname (<account>.dkr.ecr.<region>.amazonaws.com) is taken
+      # from the login action's output, which keeps the AWS account id out of
+      # this public file. Auth is GitHub OIDC -> IAM role; no stored AWS keys.
+      - name: Configure AWS credentials
+        if: ${{ inputs.registry == 'ecr' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to ECR
+        if: ${{ inputs.registry == 'ecr' }}
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Compute image metadata
         id: image-meta
         env:
           REGISTRY: ${{ inputs.registry }}
           INPUT_REGISTRY_HOST: ${{ inputs.registry-host }}
           INPUT_ACR_NAME: ${{ inputs.acr-name }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           INPUT_IMAGE_NAME: ${{ inputs.image-name }}
           INPUT_API_NAME: ${{ inputs.api-name }}
           INPUT_NAMESPACE: ${{ inputs.image-namespace }}
@@ -155,7 +184,8 @@ jobs:
             ghcr)   default_host="ghcr.io" ;;
             gitlab) default_host="registry.gitlab.com" ;;
             acr)    default_host="${INPUT_ACR_NAME:?acr-name is required when registry is acr}" ;;
-            *) echo "Unknown registry '$REGISTRY' (expected ghcr|gitlab|acr)" >&2; exit 1 ;;
+            ecr)    default_host="${ECR_REGISTRY:?ECR login did not produce a registry host (is OIDC_AWS_ROLE_ARN set?)}" ;;
+            *) echo "Unknown registry '$REGISTRY' (expected ghcr|gitlab|acr|ecr)" >&2; exit 1 ;;
           esac
           host="${INPUT_REGISTRY_HOST:-$default_host}"
           echo "host=$host" >> "$GITHUB_OUTPUT"

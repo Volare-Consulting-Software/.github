@@ -1,7 +1,7 @@
 name: build-node-container-image
 
 # Reusable CI workflow for Volare Node/Next.js apps: install -> build -> test ->
-# containerize -> push to GitHub Container Registry (GHCR).
+# containerize -> push to GitHub Container Registry (GHCR) or Amazon ECR.
 #
 # Lives in the PUBLIC Volare-Consulting-Software/.github repo so any repo in the
 # org (public or private) can call it. Self-contained — no dependency on the
@@ -12,6 +12,14 @@ name: build-node-container-image
 # a Dockerfile that installs private @volare-consulting-software packages from
 # npm.pkg.github.com can authenticate; it never lands in an image layer. Harmless
 # when unused.
+#
+# ECR (registry-provider: ecr): auth is GitHub OIDC -> the IAM role in the
+# OIDC_AWS_ROLE_ARN org secret — callers must grant `id-token: write`. The
+# registry hostname comes from the ECR login action's output at runtime, so no
+# AWS account id lives in this public file. Unlike GHCR, ECR does NOT create
+# repositories on first push: the repository must already exist and `image-name`
+# must be set to its name (the github.repository default contains the org
+# prefix, which won't match a typical ECR repository).
 #
 # Tagging is git-ref driven:
 #   main push       -> main (floating) + main-<short-sha> (immutable)
@@ -33,6 +41,17 @@ name: build-node-container-image
 #       permissions: { contents: read, packages: write }
 #       with:
 #         push-image: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+#
+# Same caller targeting ECR instead (note id-token and the inherited org secret):
+#   jobs:
+#     build-and-push:
+#       uses: Volare-Consulting-Software/.github/.github/workflows/build-node-container-image.yml@main
+#       permissions: { contents: read, packages: write, id-token: write }
+#       secrets: inherit
+#       with:
+#         registry-provider: ecr
+#         image-name: my-ecr-repo-name   # must match an EXISTING ECR repository
+#         push-image: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 on:
   workflow_call:
@@ -82,11 +101,21 @@ on:
         required: false
         type: boolean
         default: false
+      registry-provider:
+        description: "Registry provider: ghcr (default) | ecr. Selects the login mechanism and registry host."
+        required: false
+        type: string
+        default: "ghcr"
       registry:
-        description: "Container registry hostname. Defaults to ghcr.io."
+        description: "Container registry hostname. Defaults to ghcr.io. Ignored when registry-provider is ecr (the host comes from the ECR login)."
         required: false
         type: string
         default: "ghcr.io"
+      aws-region:
+        description: "AWS region of the ECR registry (used only when registry-provider is ecr)."
+        required: false
+        type: string
+        default: "us-east-1"
       runner-os:
         description: "GitHub-hosted runner image. Default ubuntu-latest."
         required: false
@@ -97,6 +126,10 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      OIDC_AWS_ROLE_ARN:
+        description: "IAM role ARN assumed via GitHub OIDC for ECR pushes. Required when registry-provider is ecr."
+        required: false
     outputs:
       image-tags:
         description: "Newline-separated list of full image refs pushed. Empty when push-image was false."
@@ -147,17 +180,36 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write   # aws-actions OIDC on the ecr path (no-op otherwise)
     outputs:
       image-tags: ${{ steps.tags.outputs.tags }}
       image-name: ${{ steps.meta.outputs.image-name-lower }}
     steps:
       - uses: actions/checkout@v4
 
+      # ECR login runs before the registry host is resolved: the hostname
+      # (<account>.dkr.ecr.<region>.amazonaws.com) is taken from the login
+      # action's output, keeping the AWS account id out of this public file.
+      - name: Configure AWS credentials
+        if: ${{ inputs.push-image && inputs.registry-provider == 'ecr' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Log in to Amazon ECR
+        if: ${{ inputs.push-image && inputs.registry-provider == 'ecr' }}
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Resolve image name (lowercased)
         id: meta
         env:
           INPUT_IMAGE_NAME: ${{ inputs.image-name }}
-          REGISTRY: ${{ inputs.registry }}
+          REGISTRY_PROVIDER: ${{ inputs.registry-provider }}
+          INPUT_REGISTRY: ${{ inputs.registry }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          PUSH_IMAGE: ${{ inputs.push-image }}
         run: |
           # GHCR / Docker Registry v2 require the path component lowercase.
           if [ -n "$INPUT_IMAGE_NAME" ]; then
@@ -167,10 +219,24 @@ jobs:
           fi
           lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
           echo "image-name-lower=$lower" >> "$GITHUB_OUTPUT"
-          echo "Image target: ${REGISTRY}/${lower}"
+
+          # Registry host: ECR's comes from the login output (empty on PR builds
+          # where push-image is false and login is skipped — harmless, since the
+          # tag computation that consumes it is skipped too).
+          if [ "$REGISTRY_PROVIDER" = "ecr" ]; then
+            host="$ECR_REGISTRY"
+            if [ "$PUSH_IMAGE" = "true" ] && [ -z "$host" ]; then
+              echo "ECR login did not produce a registry host (is OIDC_AWS_ROLE_ARN set?)" >&2
+              exit 1
+            fi
+          else
+            host="$INPUT_REGISTRY"
+          fi
+          echo "registry-host=$host" >> "$GITHUB_OUTPUT"
+          echo "Image target: ${host}/${lower}"
 
       - name: Log in to registry
-        if: ${{ inputs.push-image }}
+        if: ${{ inputs.push-image && inputs.registry-provider != 'ecr' }}
         uses: docker/login-action@v3
         with:
           registry: ${{ inputs.registry }}
@@ -185,7 +251,7 @@ jobs:
         if: ${{ inputs.push-image }}
         uses: docker/metadata-action@v5
         with:
-          images: ${{ inputs.registry }}/${{ steps.meta.outputs.image-name-lower }}
+          images: ${{ steps.meta.outputs.registry-host }}/${{ steps.meta.outputs.image-name-lower }}
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=latest,enable=${{ inputs.include-latest-tag && github.ref == 'refs/heads/main' }}
