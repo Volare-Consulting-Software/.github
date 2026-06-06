@@ -1,0 +1,76 @@
+name: draft-release
+
+# Reusable workflow that drafts a GitHub Release per main-push build. The
+# release is the artifact that operators promote on the Releases page:
+#   draft      → not promoted (no deploy events fire)
+#   prerelease → staging deploy fires (caller's `on: release: prereleased`)
+#   released   → production deploy fires (caller's `on: release: released`)
+# Tag uses the `v` prefix convention (vMAJOR.MINOR.PATCH.RUN) so the release
+# tag and the image version tag have a 1:1 mapping (strip the `v` to get the
+# image tag). Auto-generated notes from PR titles since the previous release;
+# appended footer carries the full image reference for traceability.
+#
+# Typically composed after push-container-image.yml:
+#   release:
+#     needs: image
+#     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+#     uses: Volare-Consulting-Software/.github/.github/workflows/draft-release.yml@main
+#     permissions: { contents: write }
+#     with:
+#       tag-version: ${{ needs.image.outputs.image-tag-version }}
+#       image-ref: ${{ needs.image.outputs.image-ref }}
+
+on:
+  workflow_call:
+    inputs:
+      tag-version:
+        description: "Version for the release tag, without the leading v (e.g. push-container-image's image-tag-version output)."
+        required: true
+        type: string
+      image-ref:
+        description: "Optional full image reference appended to the release notes for traceability."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag-version }}
+      IMAGE_REF: ${{ inputs.image-ref }}
+    steps:
+      - name: Compose release notes
+        run: |
+          set -euo pipefail
+          # Auto-generate the "what changed" body from PR titles since the last
+          # release. Falls back to an empty body on the first build of a repo
+          # (no prior release to diff against).
+          gh api -X POST "/repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="v${TAG}" \
+            -f target_commitish="${{ github.sha }}" \
+            --jq .body > notes.md || echo "" > notes.md
+          # Footer: the image reference this release maps to. Operators copy this
+          # for kubectl-style ops or the dispatch rollback path.
+          if [ -n "$IMAGE_REF" ]; then
+            {
+              echo
+              echo "---"
+              echo
+              echo "**Container image:** \`${IMAGE_REF}\`"
+            } >> notes.md
+          fi
+
+      - name: Create draft release
+        run: |
+          set -euo pipefail
+          gh release create "v${TAG}" \
+            --title "v${TAG}" \
+            --draft \
+            --target "${{ github.sha }}" \
+            --notes-file notes.md \
+            --repo "${{ github.repository }}"

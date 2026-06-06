@@ -1,10 +1,10 @@
 name: push-container-image
 
 # Reusable workflow that builds and publishes a container image to a registry.
-# Producing and distributing the image live together here: framework CI
-# workflows (build-node / build-dotnet) stay
-# free of docker and registry concerns and delegate both to this file. It has
-# two modes, selected by whether `source-tag` is provided:
+# Producing and distributing the image live together here; framework CI lives
+# in the composite actions (dotnet-build-and-test / node-build-and-test), and
+# caller repos compose the two as jobs however they like (example below).
+# It has two modes, selected by whether `source-tag` is provided:
 #
 #   BUILD   (source-tag empty)  → builds the image from `dockerfile` and, when
 #                                 push-image is true, pushes the computed
@@ -25,6 +25,32 @@ name: push-container-image
 # secret (callers need `id-token: write`). Unlike GHCR, ECR does NOT create
 # repositories on first push — the repository must already exist, and its name
 # must match the resolved image-name.
+#
+# Example caller (app repo) — test with the framework action, then delegate
+# all docker/registry work here. PRs run a verification build (push-image
+# false: the Dockerfile must build, but no registry login/tag/push). Append a
+# draft-release.yml job after `image` if the repo drafts releases.
+#   on:
+#     push: { branches: [main] }
+#     pull_request: { types: [opened, synchronize, reopened, ready_for_review] }
+#   concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
+#   jobs:
+#     test:
+#       if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+#       runs-on: ubuntu-latest
+#       permissions: { contents: read, packages: read }
+#       steps:
+#         - uses: actions/checkout@v4
+#         - uses: Volare-Consulting-Software/.github/.github/actions/node-build-and-test@main
+#     image:
+#       needs: test
+#       uses: Volare-Consulting-Software/.github/.github/workflows/push-container-image.yml@main
+#       permissions: { contents: read, packages: write, id-token: write }
+#       secrets: inherit
+#       with:
+#         registry: ecr                  # or ghcr | gitlab | acr
+#         image-name: my-ecr-repo-name   # ecr: must match an EXISTING repository
+#         push-image: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
 on:
   workflow_call:
