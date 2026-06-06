@@ -2,7 +2,7 @@ name: publish-npm-public
 
 # Reusable workflow: publish a package to the PUBLIC npm registry (npmjs.org).
 #
-# Sister to build-npm-package.yml — that one targets GitHub Packages
+# Sister to build-node-package.yml — that one targets GitHub Packages
 # (npm.pkg.github.com, @volare-consulting-software, GITHUB_TOKEN) for internal
 # libraries. THIS one publishes open-source packages to the public registry
 # under the @volare-consulting npm org, authenticating with an NPM_TOKEN.
@@ -33,7 +33,7 @@ name: publish-npm-public
 # -> npm publish --access public, the last three in `working-directory`. No
 # version bump and no git push — the published version is whatever the tag
 # points at, which keeps releases explicit and avoids the loop-safety dance
-# build-npm-package.yml needs.
+# build-node-package.yml needs.
 
 on:
   workflow_call:
