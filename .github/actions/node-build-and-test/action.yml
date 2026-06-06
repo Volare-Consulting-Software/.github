@@ -1,0 +1,53 @@
+name: node-build-and-test
+description: |
+  Shared build + test phase for Volare Node/Next.js projects.
+  - Sets up the requested Node version (with npm cache)
+  - Installs dependencies, builds, and tests
+
+  Caller is responsible for `actions/checkout@v4` and for declaring
+  `permissions: { contents: read, packages: read }` if the install pulls
+  private @volare-consulting-software packages from npm.pkg.github.com.
+
+inputs:
+  node-version:
+    description: "Version range passed to actions/setup-node."
+    required: false
+    default: "20"
+  install-command:
+    description: "Dependency install command. Defaults to a clean, lockfile-faithful install."
+    required: false
+    default: "npm ci"
+  build-command:
+    description: "Build command run to verify the app compiles."
+    required: false
+    default: "npm run build"
+  test-command:
+    description: "Test command. Skipped when skip-tests is true."
+    required: false
+    default: "npm test"
+  skip-tests:
+    description: "When true, skip the test step. Install/build still run."
+    required: false
+    type: boolean
+    default: false
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+
+    - name: Install
+      shell: bash
+      run: ${{ inputs.install-command }}
+
+    - name: Build
+      shell: bash
+      run: ${{ inputs.build-command }}
+
+    - name: Test
+      if: inputs.skip-tests != 'true'
+      shell: bash
+      run: ${{ inputs.test-command }}

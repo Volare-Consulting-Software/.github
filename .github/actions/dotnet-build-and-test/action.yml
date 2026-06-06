@@ -1,4 +1,4 @@
-name: build-and-test
+name: dotnet-build-and-test
 description: |
   Shared build + test phase for Volare .NET projects.
   - Sets up the requested .NET SDK

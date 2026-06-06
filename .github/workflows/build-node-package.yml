@@ -1,4 +1,4 @@
-name: build-npm-package
+name: build-node-package
 
 # Reusable build+publish workflow for Volare npm packages (TypeScript/React
 # libraries published to GitHub Packages under the @volare-consulting-software scope).
@@ -69,7 +69,7 @@ on:
     outputs:
       package-version:
         description: "Bumped version applied to package.json and published. Empty on PR runs."
-        value: ${{ jobs.build-npm-package.outputs.package-version }}
+        value: ${{ jobs.build-node-package.outputs.package-version }}
 
 permissions:
   contents: write   # for the version-bump commit + git push --follow-tags
@@ -79,11 +79,11 @@ permissions:
 # `npm publish` + `git push`. Subsequent runs queue rather than cancel —
 # every main commit gets its own published version.
 concurrency:
-  group: build-npm-package-${{ github.ref }}
+  group: build-node-package-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  build-npm-package:
+  build-node-package:
     # Skip on draft PRs. Push-to-main and workflow_dispatch have no
     # pull_request payload, so the first clause keeps them running.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false

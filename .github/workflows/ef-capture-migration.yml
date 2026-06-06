@@ -9,7 +9,7 @@ name: ef-capture-migration
 # Intended for the push-to-main path only. Migrations are normally authored in
 # the PR; this is the safety net that catches a model change shipped without one.
 # Restore authenticates to the Volare GitHub Packages feed (mirrors
-# build-and-test); ef runs `--no-build` against the pre-built output. The
+# dotnet-build-and-test); ef runs `--no-build` against the pre-built output. The
 # dotnet-ef tool version is taken from the project's EF Core package version.
 
 on:
@@ -64,7 +64,7 @@ jobs:
       head-sha: ${{ steps.result.outputs.head-sha }}
     steps:
       # fetch-depth: 0 + persisted token lets the commit below push back to the
-      # branch (mirrors build-npm-package.yml's version-bump pattern).
+      # branch (mirrors build-node-package.yml's version-bump pattern).
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

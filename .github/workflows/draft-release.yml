@@ -1,0 +1,56 @@
+name: draft-release
+
+# Drafts a GitHub Release (tag v<tag-version>) per main-push build. Operators
+# promote it on the Releases page: prerelease -> staging, released -> prod.
+# Notes are auto-generated from PR titles; image-ref is appended as a footer.
+
+on:
+  workflow_call:
+    inputs:
+      tag-version:
+        description: "Version for the release tag, without the leading v (e.g. push-container-image's image-tag-version output)."
+        required: true
+        type: string
+      image-ref:
+        description: "Optional full image reference appended to the release notes for traceability."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag-version }}
+      IMAGE_REF: ${{ inputs.image-ref }}
+    steps:
+      - name: Compose release notes
+        run: |
+          set -euo pipefail
+          # Empty body fallback covers the first release (nothing to diff against).
+          gh api -X POST "/repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="v${TAG}" \
+            -f target_commitish="${{ github.sha }}" \
+            --jq .body > notes.md || echo "" > notes.md
+          if [ -n "$IMAGE_REF" ]; then
+            {
+              echo
+              echo "---"
+              echo
+              echo "**Container image:** \`${IMAGE_REF}\`"
+            } >> notes.md
+          fi
+
+      - name: Create draft release
+        run: |
+          set -euo pipefail
+          gh release create "v${TAG}" \
+            --title "v${TAG}" \
+            --draft \
+            --target "${{ github.sha }}" \
+            --notes-file notes.md \
+            --repo "${{ github.repository }}"
