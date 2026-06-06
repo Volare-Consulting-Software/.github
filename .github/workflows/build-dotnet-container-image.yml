@@ -1,24 +1,29 @@
 name: build-dotnet-container-image
 
-# Reusable build+container-image-publish workflow for Volare .NET microservices.
+# Orchestrator for Volare .NET microservices: framework CI -> containerize ->
+# push -> release.
 # - Delegates restore/build/test to the shared `build-and-test` composite action
-# - On non-PR runs (when push-image is true), delegates the image build+push to
-#   push-container-image.yml, tagged with `<csproj-Version>.<github.run_number>`
-#   (or just `<github.run_number>` when no version-csproj is provided).
+# - On non-PR runs (when push-image is true), delegates the docker build to the
+#   generic containerize-image.yml (image.tar workflow artifact), then the push
+#   to push-container-image.yml's LOAD mode, tagged with
+#   `<csproj-Version>.<github.run_number>` (or just `<github.run_number>` when
+#   no version-csproj is provided).
 #
 # Registry is selectable via the `registry` input:
 #   ghcr   (default) → ghcr.io/<owner>/<image>            (GITHUB_TOKEN auth)
 #   gitlab           → registry.gitlab.com/<ns>/<image>   (GITLAB_USERNAME/TOKEN)
 #   acr              → <acr-name>/<image>          (azure/login OIDC)
+#   ecr              → <account>.dkr.ecr.<region>.amazonaws.com/<image> (GitHub OIDC → IAM role)
 # Defaults align with GHCR; services deploying to Azure App Service / Functions
 # (which pull from ACR via deploy-azure-app-service.yml / deploy-azure-function-app.yml)
 # must set `registry: acr` so the build pushes where the deploy pulls.
 #
 # Tagging: `include-version-tag` (default true) pushes the immutable
 # `<Version>.<run_number>` tag; `include-latest-tag` (default false) also pushes
-# `:latest`. At least one must be enabled when push-image is true. The actual
-# build + push + tag resolution lives in push-container-image.yml; this workflow
-# computes the build inputs, gates on build-and-test, and drafts the release.
+# `:latest`. At least one must be enabled when push-image is true. Producing the
+# image lives in containerize-image.yml; tag resolution + registry push live in
+# push-container-image.yml. This workflow computes the inputs, gates on
+# build-and-test, and drafts the release.
 #
 # Scope is the container image side only; nupkg publishing belongs to
 # build-dotnet-package.yml.
@@ -84,7 +89,7 @@ on:
         type: boolean
         default: false
       registry:
-        description: "Target registry provider: ghcr (default) | gitlab | acr. Selects the login mechanism and the default host/namespace."
+        description: "Target registry provider: ghcr (default) | gitlab | acr | ecr. Selects the login mechanism and the default host/namespace."
         required: false
         type: string
         default: "ghcr"
@@ -129,6 +134,8 @@ on:
       OIDC_TENANT_ID:
         required: false
       OIDC_SUBSCRIPTION_ID:
+        required: false
+      OIDC_AWS_ROLE_ARN:
         required: false
       GITLAB_USERNAME:
         required: false
@@ -178,17 +185,28 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           skip-tests: ${{ inputs.skip-tests }}
 
-  # Build + push the image (BUILD mode: no source-tag). Gated on a green
-  # build-and-test and only when push-image is true (PRs build+test only).
-  push:
+  # Produce the image (generic docker build -> image.tar artifact). Gated on a
+  # green build-and-test and only when push-image is true (PRs build+test only,
+  # matching the previous behavior where no image work ran on PRs).
+  containerize:
     needs: [build-and-test]
     if: ${{ inputs.push-image }}
+    uses: ./.github/workflows/containerize-image.yml
+    with:
+      image-name: ${{ inputs.image-name || inputs.api-name }}
+      dockerfile: ${{ inputs.dockerfile }}
+      runner-os: ${{ inputs.runner-os }}
+
+  # Push the exported image (LOAD mode). Only this leg knows the registry.
+  # Skipped automatically when containerize was skipped (no always()).
+  push:
+    needs: [containerize]
     uses: ./.github/workflows/push-container-image.yml
     with:
       api-name: ${{ inputs.api-name }}
       image-name: ${{ inputs.image-name }}
       version-csproj: ${{ inputs.version-csproj }}
-      dockerfile: ${{ inputs.dockerfile }}
+      image-artifact: ${{ needs.containerize.outputs.image-artifact }}
       registry: ${{ inputs.registry }}
       registry-host: ${{ inputs.registry-host }}
       image-namespace: ${{ inputs.image-namespace }}

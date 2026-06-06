@@ -1,23 +1,17 @@
 name: build-node-container-image
 
-# Reusable CI workflow for Volare Node/Next.js apps: install -> build -> test ->
-# containerize -> export the image as a workflow artifact.
+# Orchestrator for Volare Node/Next.js apps: framework CI (install -> build ->
+# test) followed by the generic containerize-image.yml, which exports the
+# built image as a workflow artifact (image.tar).
 #
-# Lives in the PUBLIC Volare-Consulting-Software/.github repo so any repo in the
-# org (public or private) can call it. Self-contained — no dependency on the
-# private Volare.Build repo.
+# Lives in the PUBLIC Volare-Consulting-Software/.github repo so any repo in
+# the org (public or private) can call it. Self-contained — no dependency on
+# the private Volare.Build repo.
 #
-# This workflow is deliberately registry-agnostic: it never logs in to or
-# pushes to a container registry. Every run exports the built image as a
-# docker tar (image.tar) under the `image-artifact` workflow artifact, tagged
-# with a registry-free local ref. A downstream push-container-image.yml job in
-# the same run loads that artifact and owns every registry decision (provider,
-# host, name, tags).
-#
-# Auth: the caller run's GITHUB_TOKEN is exposed to the Docker build as a
-# BuildKit secret named `gh_token`, so a Dockerfile that installs private
-# @volare-consulting-software packages from npm.pkg.github.com can
-# authenticate; it never lands in an image layer. Harmless when unused.
+# Only the test job here is node-specific. Containerization is delegated to
+# containerize-image.yml, and nothing in this pipeline knows registries exist:
+# a downstream push-container-image.yml job in the caller loads the exported
+# artifact and owns every registry decision (provider, host, name, tags).
 #
 # Draft PRs are skipped (see the job-level `if:`). Callers should add
 # `ready_for_review` to their `pull_request: types:` so the build runs when a
@@ -99,13 +93,13 @@ on:
     outputs:
       image-artifact:
         description: "Name of the uploaded workflow artifact containing image.tar."
-        value: ${{ jobs.build-node-container-image.outputs.image-artifact }}
+        value: ${{ jobs.containerize.outputs.image-artifact }}
       exported-image-ref:
         description: "Local image reference the tar's image is tagged with."
-        value: ${{ jobs.build-node-container-image.outputs.exported-image-ref }}
+        value: ${{ jobs.containerize.outputs.exported-image-ref }}
       image-name:
         description: "The lowercased image name used in the local ref."
-        value: ${{ jobs.build-node-container-image.outputs.image-name }}
+        value: ${{ jobs.containerize.outputs.image-name }}
 
 # Container builds are expensive; only the latest commit on a ref matters.
 concurrency:
@@ -113,7 +107,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ---- build + test -------------------------------------------------------
+  # ---- build + test (the node-specific part) -------------------------------
   test:
     # Skip on draft PRs and when the caller opts out.
     if: ${{ inputs.skip-tests != true && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
@@ -138,70 +132,20 @@ jobs:
       - name: Test
         run: ${{ inputs.test-command }}
 
-  # ---- containerize + export ----------------------------------------------
-  build-node-container-image:
+  # ---- containerize + export (generic, delegated) ---------------------------
+  containerize:
     # Run after tests, but still run when tests were skipped (the `if` keeps the
     # container build alive even if `test` was skipped, via always() + result
     # check). Draft PRs are skipped here too.
     needs: test
     if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
-    runs-on: ${{ inputs.runner-os }}
+    uses: ./.github/workflows/containerize-image.yml
     permissions:
       contents: read
       packages: read
-    outputs:
-      image-artifact: ${{ steps.meta.outputs.artifact-name }}
-      exported-image-ref: ${{ steps.meta.outputs.local-ref }}
-      image-name: ${{ steps.meta.outputs.image-name-lower }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve local image ref
-        id: meta
-        env:
-          INPUT_IMAGE_NAME: ${{ inputs.image-name }}
-          ARTIFACT_NAME: ${{ inputs.image-artifact }}
-        run: |
-          # Docker requires the path component lowercase.
-          if [ -n "$INPUT_IMAGE_NAME" ]; then
-            raw="$INPUT_IMAGE_NAME"
-          else
-            raw="${{ github.repository }}"
-          fi
-          lower=$(echo "$raw" | tr '[:upper:]' '[:lower:]')
-          short_sha=$(echo "${{ github.sha }}" | cut -c1-7)
-          echo "image-name-lower=$lower" >> "$GITHUB_OUTPUT"
-          echo "artifact-name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
-          # Registry-free on purpose: the downstream push workflow decides
-          # where the image actually goes.
-          echo "local-ref=local/${lower}:${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "Exporting local/${lower}:${short_sha} as artifact '${ARTIFACT_NAME}'"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build image
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ inputs.build-context }}
-          file: ${{ inputs.dockerfile }}
-          tags: ${{ steps.meta.outputs.local-ref }}
-          # Write the image to a tar instead of any registry or daemon.
-          outputs: type=docker,dest=/tmp/image.tar
-          # Expose GITHUB_TOKEN to the build so a Dockerfile installing private
-          # @volare-consulting-software packages can authenticate. Mounted only
-          # for the RUN that uses it; never persisted in a layer.
-          secrets: |
-            gh_token=${{ secrets.GITHUB_TOKEN }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Upload image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.image-artifact }}
-          path: /tmp/image.tar
-          if-no-files-found: error
-          # The artifact is a handoff to the push job in the same run, not an
-          # archive — keep retention minimal.
-          retention-days: 1
+    with:
+      image-name: ${{ inputs.image-name }}
+      dockerfile: ${{ inputs.dockerfile }}
+      build-context: ${{ inputs.build-context }}
+      image-artifact: ${{ inputs.image-artifact }}
+      runner-os: ${{ inputs.runner-os }}
