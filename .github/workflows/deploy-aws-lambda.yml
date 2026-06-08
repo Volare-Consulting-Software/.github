@@ -1,0 +1,78 @@
+name: deploy-aws-lambda
+
+# Reusable deploy workflow for Volare container Lambdas. Points an existing
+# Lambda function at an image already in ECR (the released version tag) and waits
+# for the update to finish. Called from a repo's release.yml on the released event.
+# Lambda snapshots the image at update time — deploys are explicit update calls.
+
+on:
+  workflow_call:
+    inputs:
+      function-name:
+        description: "Lambda function to update. Example: fishon"
+        required: true
+        type: string
+      image-name:
+        description: "ECR repository name (image path segment). Example: fishon"
+        required: true
+        type: string
+      image-tag:
+        description: "Image tag to deploy. Pass the raw release tag (e.g. v0.1.3) — a leading 'v' is stripped here."
+        required: true
+        type: string
+      aws-region:
+        description: "AWS region of the Lambda function and ECR registry."
+        required: false
+        type: string
+        default: "us-east-1"
+      environment-name:
+        description: "GitHub Environment to bind to for secrets/gating. Defaults to production."
+        required: false
+        type: string
+        default: "production"
+    secrets:
+      OIDC_AWS_ROLE_ARN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment-name }}
+    steps:
+      # OIDC -> IAM role; region from input.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # Login output gives the registry host, keeping the account id out of this file.
+      - name: Log in to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Strip leading 'v', build the image URI, update the function, wait for it to settle.
+      - name: Update Lambda function code
+        env:
+          FUNCTION_NAME: ${{ inputs.function-name }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          tag="${IMAGE_TAG#v}"
+          image_uri="${ECR_REGISTRY}/${IMAGE_NAME}:${tag}"
+          echo "Deploying $image_uri to $FUNCTION_NAME"
+          aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --region "$AWS_REGION" \
+            --image-uri "$image_uri"
+          aws lambda wait function-updated \
+            --function-name "$FUNCTION_NAME" \
+            --region "$AWS_REGION"
+          echo "Deployed $image_uri"
