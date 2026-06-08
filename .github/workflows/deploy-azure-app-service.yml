@@ -185,7 +185,7 @@ jobs:
           #   2. Release event: derive from github.event.release.tag_name
           #      (release-tag-name → image-tag is a 1:1 mapping with `v` stripped).
           #   3. workflow_run auto path: read csproj <Version> and combine with
-          #      workflow_run.run_number — same formula as push-container-image.yml.
+          #      workflow_run.run_number — same formula as push-container-image.yml (csproj-based variant).
           if [ -n "$INPUT_TAG" ]; then
             tag="${INPUT_TAG#v}"
           elif [ "$EVENT" = "release" ] && [ -n "$RELEASE_TAG" ]; then

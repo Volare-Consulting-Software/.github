@@ -1,5 +1,8 @@
 name: build-dotnet-package
 
+# NOTE: predates the release-driven CI/CD convention (main push should publish
+# <MAJ.MIN>.<run>-rc prereleases and draft a release; stable versions only on
+# the released event). Migrates to that model together with the package repos.
 # Reusable build+pack+publish workflow for Volare .NET NuGet libraries.
 # - Delegates restore/build/test to the shared `build-and-test` composite action
 # - Reads <Version> from the package csproj, packs with --include-symbols
