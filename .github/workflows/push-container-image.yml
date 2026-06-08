@@ -360,8 +360,7 @@ jobs:
           DEST_REFS: ${{ steps.image-meta.outputs.dest-refs }}
         run: |
           set -euo pipefail
-          # Registry-side retag preserving the manifest byte-for-byte (buildx
-          # imagetools wraps single manifests in an index, which Lambda rejects).
+          # Registry-side retag preserving the manifest byte-for-byte.
           while IFS= read -r dest; do
             [ -z "$dest" ] && continue
             echo "Tagging ${dest} -> ${SOURCE_REF}"
