@@ -46,6 +46,7 @@ This `.github` repo isn't just an org profile — it's Volare's central library 
 | **Container plumbing** | `push-container-image` | One implementation for both building+pushing an image and promoting (registry-side re-tagging) an existing one across registries. |
 | **Release staging** | `draft-release` | Drafts a v-tagged release per main-push build with auto-generated notes; publishing the release is what ships. |
 | **Azure deploy** | `deploy-azure-app-service`, `deploy-azure-function-app` | Pull a pre-built image from ACR and deploy it to the env-specific App Service / Function App via OIDC, gated through GitHub Environments (`dev` / `staging` / `production`). |
+| **AWS deploy** | `deploy-aws-lambda` | Point an existing container Lambda at an image already in ECR (the released version tag) via OIDC and wait for the update, gated through GitHub Environments. |
 | **Database (EF Core)** | `ef-capture-migration`, `ef-deploy` | Auto-capture migration drift on a push to main; generate and apply idempotent migration scripts on release. |
 | **Housekeeping** | `cancel-on-close` | Kill an in-flight build when its PR is admin-merged or closed, so no runner minutes burn on an outcome no one's waiting on. |
 
