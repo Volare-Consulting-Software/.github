@@ -339,6 +339,11 @@ jobs:
           context: ${{ inputs.build-context }}
           file: ${{ inputs.dockerfile }}
           push: true
+          # Plain docker-v2 manifests: buildx attestations wrap the image in an
+          # index that AWS Lambda's image ingestion rejects ("manifest, config
+          # or layer media type ... not supported").
+          provenance: false
+          sbom: false
           # gh_token: BuildKit secret for private GitHub Packages restores;
           # mounted per-RUN, never lands in a layer.
           secrets: |
