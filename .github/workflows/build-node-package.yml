@@ -1,5 +1,8 @@
 name: build-node-package
 
+# NOTE: predates the release-driven CI/CD convention (main push should publish
+# <MAJ.MIN>.<run>-rc prereleases and draft a release; stable versions only on
+# the released event). Migrates to that model together with the package repos.
 # Reusable build+publish workflow for Volare npm packages (TypeScript/React
 # libraries published to GitHub Packages under the @volare-consulting-software scope).
 # Sister to build-dotnet-package.yml (.NET/NuGet) — different ecosystem, same shape:
