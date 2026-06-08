@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: ""
+      version-package-json:
+        description: "BUILD mode: optional path to a package.json whose version's MAJOR.MINOR provides the version-tag base (<MAJ.MIN>.<run_number>). Ignored when version-csproj resolves a base, and in PROMOTE mode."
+        required: false
+        type: string
+        default: ""
       dockerfile:
         description: "BUILD mode: path to the Dockerfile. Defaults to ./Dockerfile."
         required: false
@@ -160,6 +165,7 @@ jobs:
           INPUT_API_NAME: ${{ inputs.api-name }}
           INPUT_NAMESPACE: ${{ inputs.image-namespace }}
           INPUT_VERSION_CSPROJ: ${{ inputs.version-csproj }}
+          INPUT_VERSION_PACKAGE_JSON: ${{ inputs.version-package-json }}
           OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
           RUN_NUMBER: ${{ github.run_number }}
@@ -250,10 +256,17 @@ jobs:
             # ---------- BUILD ----------
             echo "mode=build" >> "$GITHUB_OUTPUT"
 
-            # Version tag: <csproj Version>.<run_number> or <run_number>.
+            # Version tag base: csproj <Version>, else package.json MAJOR.MINOR,
+            # else none — final tag is <base>.<run_number> or bare <run_number>.
             version=""
             if [ -n "$INPUT_VERSION_CSPROJ" ] && [ -f "$INPUT_VERSION_CSPROJ" ]; then
               base=$(grep -oP '(?<=<Version>)[^<]+(?=</Version>)' "$INPUT_VERSION_CSPROJ" | head -1 | tr -d '[:space:]' || true)
+              if [ -n "$base" ]; then
+                version="${base}.${RUN_NUMBER}"
+              fi
+            fi
+            if [ -z "$version" ] && [ -n "$INPUT_VERSION_PACKAGE_JSON" ] && [ -f "$INPUT_VERSION_PACKAGE_JSON" ]; then
+              base=$(jq -r '.version // empty' "$INPUT_VERSION_PACKAGE_JSON" | cut -d. -f1-2)
               if [ -n "$base" ]; then
                 version="${base}.${RUN_NUMBER}"
               fi
