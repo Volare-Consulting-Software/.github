@@ -339,6 +339,8 @@ jobs:
           context: ${{ inputs.build-context }}
           file: ${{ inputs.dockerfile }}
           push: true
+          provenance: false
+          sbom: false
           # gh_token: BuildKit secret for private GitHub Packages restores;
           # mounted per-RUN, never lands in a layer.
           secrets: |
