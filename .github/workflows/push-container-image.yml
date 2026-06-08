@@ -349,6 +349,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Set up crane
+        if: ${{ steps.image-meta.outputs.mode == 'promote' }}
+        uses: imjasonh/setup-crane@v0.4
+
       - name: Promote existing image to dest tag(s)
         if: ${{ steps.image-meta.outputs.mode == 'promote' }}
         env:
@@ -356,9 +360,10 @@ jobs:
           DEST_REFS: ${{ steps.image-meta.outputs.dest-refs }}
         run: |
           set -euo pipefail
-          # Registry-side retag: same digest, no layer pull, preserves multi-arch.
+          # Registry-side retag preserving the manifest byte-for-byte (buildx
+          # imagetools wraps single manifests in an index, which Lambda rejects).
           while IFS= read -r dest; do
             [ -z "$dest" ] && continue
             echo "Tagging ${dest} -> ${SOURCE_REF}"
-            docker buildx imagetools create --tag "$dest" "$SOURCE_REF"
+            crane copy "$SOURCE_REF" "$dest"
           done <<< "$DEST_REFS"
