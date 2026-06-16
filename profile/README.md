@@ -8,11 +8,13 @@
 
 Volare is the engineering team you bring on when the team you have can't get to it. Engagements are scoped to ship, not to bill — we commit to outcomes, not hours.
 
+🌐 **[go-volare.com](https://go-volare.com)** — what we build, how we work, and how to start a project.
+
 **What you're looking at** is the public slice of how Volare actually works: the brand system every artifact draws from, the AI-driven SDLC engine that ships our engagements, the agent that talks to customers, and the reusable CI/CD that builds and deploys all of it. Each repo below is a real, in-use piece of the platform — not a demo.
 
 ## How we build software
 
-A handful of repos here do most of the work. Three of them define how Volare ships, one defines how Volare sounds, and the reusable workflows in *this* repo define how it all gets built and deployed.
+A handful of repos here do most of the work. Several define how Volare ships, one defines how Volare sounds, and the reusable workflows in *this* repo define how it all gets built and deployed.
 
 ### `volare-brand` — how Volare presents itself
 
@@ -20,20 +22,39 @@ The single source of truth for colors, typography, components, voice, naming, an
 
 ### `pilota` — the SDLC engine
 
-Pilota drives a software project end-to-end with a coordinated team of specialist AI agents and a human in the loop at the gates that matter: requirements → PRD → design → walking skeleton → vertical slices → tests → review → merge. It's **language-agnostic** and **integration-agnostic** — works whether you're shipping TypeScript on Vercel through GitHub Actions with Linear tickets, or C# on Azure through Azure Pipelines with Jira. Every spoke (language, CI/CD, deployment, project management, branding, LLM provider) is interchangeable per engagement.
+Pilota is the AI engine Volare uses to deliver engagements: a coordinated team of specialist agents does the work between checkpoints, and **a person signs off at every gate**. AI is fast but it gets things wrong — so the calls that matter (what to build, what's good enough, what ships) always belong to a human. It's **language-** and **integration-agnostic** too: the same engine ships TypeScript on Vercel or C# on Azure, with your tickets, your cloud, your stack.
 
-Two design choices set it apart from "AI generated my repo":
+Every project moves through the same stages, and **the middle of it is a loop** — Pilota builds a slice, a human reviews it, and the cycle repeats until the product is done:
 
-- **Three named runtimes** (`cli`, `app-cli`, `sdk`) share one state machine, agent roster, and set of human gates — only *where state lives* and *who drives turn cadence* differ. The same agent prompts run in a local Claude Code session, against a hosted pilota-app over MCP, or inside a long-lived Node service using the Claude Agent SDK.
-- **Per-step model selection.** Each agent step binds to whichever model best fits it — heavier reasoning models for architecture, cheap models for classification — declared in `plugin.json`, not a single project-wide LLM.
+```
+                          ┌──── repeat for each slice ────┐
+                          │                               │
+   Plan ──▶ Skeleton ──▶ Slice ──▶ Review ────────────────┘──▶ Ship
+    (👤)      (👤)        (👤)       (👤)                       (👤)
 
-### `volare-pilota-pack` — Volare's house style for Pilota
+   (👤) = human gate — AI does the work between gates; people approve what advances
+```
 
-Pilota stays generic. `volare-pilota-pack` is the opinionated overlay for Volare-internal engagements — coding conventions, delivery patterns for the GitHub and Azure DevOps stacks, and per-product context. Drops into `~/.pilota/` so any Pilota engagement on Volare work picks up Volare standards automatically. Other Pilota consumers ship their own packs.
+- **Plan it** — what to build, who it's for, and what *done* looks like — agreed, and signed off by a human, before any code is written.
+- **Build it small first** — a working version of the whole thing on day one: real routes, real data, real deploys. Not a mockup, not a slide.
+- **Grow it in usable pieces, iteratively** — Pilota builds one slice, a human reviews it, then it builds the next. That build-review loop repeats slice by slice, each pass adding a feature you can demo or ship — the product grows one approved step at a time, on a schedule that holds.
+- **Review every step** — humans stay in the loop at every gate, deciding what's good enough and what ships next. Quality is never an afterthought, and nothing advances past a checkpoint no one approved.
+
+→ See how we work, in plain terms: **[go-volare.com/pilota](https://go-volare.com/pilota)**
+
+### `pilota-app` — the hosted runtime for Pilota
+
+Pilota is the engine; `pilota-app` is where you watch it run and steer it. A Next.js web app that turns a live engagement into a Linear-style project tracker — every stage and every gate visible as it happens — and routes approvals to the right people (through Vito) so a project never stalls waiting on a decision. The engine decides *what* happens next; `pilota-app` is *where the work shows up and the humans steer*.
+
+### `volare-ai` — Volare's house style for Pilota
+
+Pilota stays generic. `volare-ai` is the opinionated overlay for Volare-internal engagements — coding conventions, delivery patterns for the GitHub and Azure DevOps stacks, and per-product context. Drops into `~/.pilota/` so any Pilota engagement on Volare work picks up Volare standards automatically. Other Pilota consumers ship their own packs.
 
 ### `vito.ai` — Volare's AI agent
 
-Vito is the voice of Volare for chatbots, agentic workflows, and customer-facing surfaces — he inherits brand voice from `volare-brand` and adds character on top. At runtime he's also the **human-in-the-loop layer between Pilota and the people who own the gates**: he receives gate hand-offs from Pilota, routes them to the right operators over a real channel (Telegram first, others behind the same interface), captures *which* operator made each call, and hands the resolution back to Pilota's resume loop. Next.js dashboard + API, channel-agnostic by design.
+Vito is the voice of Volare for chatbots, agentic workflows, and customer-facing surfaces — he inherits brand voice from `volare-brand` and adds character on top. He's also the **human-in-the-loop layer between Pilota and the people who own the gates**: when a project needs a decision, Vito brings it to the right person on the channel they already use and carries their answer back. Channel-agnostic by design.
+
+→ Meet Vito: **[go-volare.com/vito](https://go-volare.com/vito)**
 
 ### Shared CI/CD — the reusable workflows in *this* repo
 
@@ -63,9 +84,10 @@ These cover the full path from PR to production — build, test, version, contai
                            │     (talks to customers; relays Pilota gates to operators)
                            │
                            └──→  pilota engagements
-                                 ⬑ volare-pilota-pack   (Volare standards)
-                                 ⬑ shared CI/CD          (this repo's reusable workflows)
+                                 ⬑ pilota-app           (hosted runtime + dashboard)
+                                 ⬑ volare-ai            (Volare standards)
+                                 ⬑ shared CI/CD         (this repo's reusable workflows)
                                  (builds + ships software)
 ```
 
-`volare-brand` is the throughline — it's what makes a Volare proposal, a Pilota-built feature, and a Vito reply all sound recognizably like Volare. Pilota is the engine, `volare-pilota-pack` is Volare's configuration of it, the reusable workflows here are how everything gets built and deployed, and Vito is the voice tying customer conversations back to the work.
+`volare-brand` is the throughline — it's what makes a Volare proposal, a Pilota-built feature, and a Vito reply all sound recognizably like Volare. Pilota is the engine, `pilota-app` is the hosted runtime that drives it, `volare-ai` is Volare's configuration of it, the reusable workflows here are how everything gets built and deployed, and Vito is the voice tying customer conversations back to the work.
