@@ -1,13 +1,19 @@
 name: build-dotnet-package
 
-# NOTE: predates the release-driven CI/CD convention (main push should publish
-# <MAJ.MIN>.<run>-rc prereleases and draft a release; stable versions only on
-# the released event). Migrates to that model together with the package repos.
 # Reusable build+pack+publish workflow for Volare .NET NuGet libraries.
 # - Delegates restore/build/test to the shared `build-and-test` composite action
-# - Reads <Version> from the package csproj, packs with --include-symbols
-# - Pushes to https://nuget.pkg.github.com/Volare-Consulting-Software/index.json with --skip-duplicate
+# - Packs with --include-symbols and pushes to
+#   https://nuget.pkg.github.com/Volare-Consulting-Software/index.json with --skip-duplicate
 #   (so re-running on the same version is a no-op rather than a failure)
+#
+# Pack + push run in one of three modes:
+#   - GitHub `release` event  -> version comes from the release tag (strip leading `v`);
+#     a prerelease tag like `v10.1.0-rc1` publishes a NuGet prerelease, `v10.1.0` a stable.
+#     This is the release-driven model (see conventions/cicd.md).
+#   - push to main (when `publish-on-main` is true, the default) -> `<csproj Version>.<run_number>`.
+#   - any branch with `version-suffix` set -> `<csproj Version>.<run_number>-<suffix>` prerelease.
+# PR runs are build + test only — GitHub Packages versions are immutable, so we
+# don't burn a version per PR push.
 #
 # Draft PRs do not trigger this workflow's work — see the job-level `if:` below.
 # Callers should add `ready_for_review` to their `pull_request: types:` list so
@@ -15,6 +21,10 @@ name: build-dotnet-package
 #   on:
 #     pull_request:
 #       types: [opened, synchronize, reopened, ready_for_review]
+# Release-driven callers add:
+#   on:
+#     release:
+#       types: [prereleased, released]
 
 on:
   workflow_call:
@@ -63,6 +73,11 @@ on:
         required: false
         type: string
         default: ""
+      publish-on-main:
+        description: "When true (default), a push to main packs and pushes <base>.<run_number>. Set false for release-driven repos that publish only on the GitHub `release` event."
+        required: false
+        type: boolean
+        default: true
     outputs:
       package-version:
         description: "The PackageVersion read from the csproj and used in the nupkg filename."
@@ -102,35 +117,52 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           skip-tests: ${{ inputs.skip-tests }}
 
-      # Pack + push run on either:
-      #   - push to main (release version: <base>.<run_number>), or
+      # Pack + push run on one of:
+      #   - a GitHub `release` event (version = release tag, minus leading `v`),
+      #   - push to main when `publish-on-main` is true (version: <base>.<run_number>), or
       #   - any branch with `version-suffix` set (pre-release: <base>.<run_number>-<suffix>).
       # PR runs do build + test only — versions on GitHub Packages are immutable,
       # so we don't burn a version number per PR push.
       - name: Compute PackageVersion
-        if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || inputs.version-suffix != ''
+        if: (github.ref == 'refs/heads/main' && github.event_name == 'push' && inputs.publish-on-main) || inputs.version-suffix != '' || github.event_name == 'release'
         id: version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          # csproj <Version> element supplies the major.minor; github.run_number
-          # supplies the patch. Final version: "<base>.<run_number>[-<suffix>]"
-          base=$(grep -oP '(?<=<Version>)[^<]+(?=</Version>)' "${{ inputs.package-csproj }}" | head -1 | tr -d '[:space:]')
-          if [ -z "$base" ]; then
-            echo "::error::No <Version> element found in ${{ inputs.package-csproj }}" && exit 1
-          fi
-          version="${base}.${{ github.run_number }}"
-          suffix="${{ inputs.version-suffix }}"
-          if [ -n "$suffix" ]; then
-            # SemVer pre-release identifier: one or more dot-separated tokens of [0-9A-Za-z-].
-            if ! printf '%s' "$suffix" | grep -Eq '^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$'; then
-              echo "::error::version-suffix '$suffix' is not a valid SemVer pre-release identifier (allowed: [0-9A-Za-z-], dot-separated)." && exit 1
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # Release-driven: the release tag is authoritative. Strip a leading `v`.
+            # A prerelease tag (e.g. v10.1.0-rc1) yields a NuGet prerelease; v10.1.0 a stable.
+            version="${RELEASE_TAG#v}"
+            if [ -z "$version" ]; then
+              echo "::error::Release tag_name is empty" && exit 1
             fi
-            version="${version}-${suffix}"
+            # NuGet/SemVer: 2-4 numeric segments + optional -prerelease of dot-separated [0-9A-Za-z-] tokens.
+            if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+              echo "::error::Release tag '$RELEASE_TAG' does not yield a valid package version ('$version')." && exit 1
+            fi
+            echo "Release-driven package version from tag '$RELEASE_TAG': $version"
+          else
+            # csproj <Version> element supplies the major.minor; github.run_number
+            # supplies the patch. Final version: "<base>.<run_number>[-<suffix>]"
+            base=$(grep -oP '(?<=<Version>)[^<]+(?=</Version>)' "${{ inputs.package-csproj }}" | head -1 | tr -d '[:space:]')
+            if [ -z "$base" ]; then
+              echo "::error::No <Version> element found in ${{ inputs.package-csproj }}" && exit 1
+            fi
+            version="${base}.${{ github.run_number }}"
+            suffix="${{ inputs.version-suffix }}"
+            if [ -n "$suffix" ]; then
+              # SemVer pre-release identifier: one or more dot-separated tokens of [0-9A-Za-z-].
+              if ! printf '%s' "$suffix" | grep -Eq '^[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*$'; then
+                echo "::error::version-suffix '$suffix' is not a valid SemVer pre-release identifier (allowed: [0-9A-Za-z-], dot-separated)." && exit 1
+              fi
+              version="${version}-${suffix}"
+            fi
+            echo "Computed package version: $version (csproj base: $base, run_number: ${{ github.run_number }}, suffix: ${suffix:-<none>})"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Computed package version: $version (csproj base: $base, run_number: ${{ github.run_number }}, suffix: ${suffix:-<none>})"
 
       - name: Pack
-        if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || inputs.version-suffix != ''
+        if: (github.ref == 'refs/heads/main' && github.event_name == 'push' && inputs.publish-on-main) || inputs.version-suffix != '' || github.event_name == 'release'
         env:
           VERSION_BUILD: ${{ steps.version.outputs.version }}
         run: |
@@ -149,7 +181,7 @@ jobs:
             ${{ inputs.extra-pack-args }}
 
       - name: Push to GitHub Packages
-        if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || inputs.version-suffix != ''
+        if: (github.ref == 'refs/heads/main' && github.event_name == 'push' && inputs.publish-on-main) || inputs.version-suffix != '' || github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
