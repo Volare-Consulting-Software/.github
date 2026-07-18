@@ -1,0 +1,74 @@
+name: prisma-deploy
+
+# Reusable workflow that applies Prisma migrations to a database when a release
+# is published. Runs `prisma migrate deploy` from the released source, which
+# applies only pending migrations and never drops data — so re-publishing a
+# release is a no-op against an already-migrated database (the Prisma analog of
+# ef-deploy.yml's idempotent script).
+#
+# Migrations themselves are authored in the pull request (`prisma migrate dev`,
+# committed under prisma/migrations) — there is deliberately no capture step:
+# unlike EF, the Prisma workflow keeps schema-to-migration authoring in the PR,
+# not in CI.
+#
+# `environment-name` (default production) scopes the run to a GitHub Environment
+# so DATABASE_URL resolves to that environment's secret. Point it at the target's
+# DIRECT (non-pooled) connection string. The target database must allow the
+# GitHub-hosted runner to connect.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory containing package.json + prisma/ (where prisma migrate deploy runs). Example: api"
+        required: false
+        type: string
+        default: "."
+      checkout-ref:
+        description: "Git ref to deploy from — the published release tag, so the released migrations are present."
+        required: false
+        type: string
+        default: ""
+      environment-name:
+        description: "GitHub Environment whose DATABASE_URL secret to use."
+        required: false
+        type: string
+        default: "production"
+      node-version:
+        description: "Version passed to actions/setup-node."
+        required: false
+        type: string
+        default: "22"
+    secrets:
+      DATABASE_URL:
+        description: "Connection string for the target database. Provide via the GitHub Environment named by environment-name; use the DIRECT (non-pooled) string."
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  prisma-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment-name }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout-ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # Installs the prisma CLI (and generates the client via postinstall — no DB
+      # needed for that). Migrations are applied in the next step.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply pending migrations
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: npx prisma migrate deploy
