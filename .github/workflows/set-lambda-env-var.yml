@@ -1,0 +1,76 @@
+name: set-lambda-env-var
+
+# Reusable workflow that sets (creates or updates) a single environment variable
+# on an AWS Lambda function, preserving all the function's other variables.
+# `aws lambda update-function-configuration` replaces the entire variable map, so
+# this reads the current configuration, merges in the one variable, and writes it
+# back. Authenticates via GitHub OIDC. Callers typically run this on release to
+# push a secret from a GitHub Environment onto the function, keeping the secret in
+# one place (the GitHub secret) with CI as the propagator.
+#
+# The caller's OIDC role needs lambda:GetFunctionConfiguration and
+# lambda:UpdateFunctionConfiguration on the target function.
+
+on:
+  workflow_call:
+    inputs:
+      function-name:
+        description: "Lambda function to update. Example: my-api"
+        required: true
+        type: string
+      var-name:
+        description: "Name of the environment variable to set/update. Example: DATABASE_URL"
+        required: true
+        type: string
+      aws-region:
+        description: "AWS region of the Lambda function."
+        required: false
+        type: string
+        default: "us-east-1"
+      environment-name:
+        description: "GitHub Environment to bind to for secrets/gating. Defaults to production."
+        required: false
+        type: string
+        default: "production"
+    secrets:
+      var-value:
+        description: "Value to set for the environment variable."
+        required: true
+      OIDC_AWS_ROLE_ARN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  set-env:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment-name }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Set the variable (merge, preserving the function's other vars)
+        env:
+          FUNCTION_NAME: ${{ inputs.function-name }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          VAR_NAME: ${{ inputs.var-name }}
+          VAR_VALUE: ${{ secrets.var-value }}
+        run: |
+          set -euo pipefail
+          current=$(aws lambda get-function-configuration \
+            --function-name "$FUNCTION_NAME" --region "$AWS_REGION" \
+            --query 'Environment.Variables' --output json)
+          # A function with no environment variables returns null — treat as {}.
+          [ "$current" = "null" ] && current='{}'
+          jq -n --argjson cur "$current" --arg k "$VAR_NAME" --arg v "$VAR_VALUE" \
+            '{Variables: ($cur + {($k): $v})}' > env.json
+          aws lambda update-function-configuration \
+            --function-name "$FUNCTION_NAME" --region "$AWS_REGION" \
+            --environment file://env.json
+          aws lambda wait function-updated \
+            --function-name "$FUNCTION_NAME" --region "$AWS_REGION"
