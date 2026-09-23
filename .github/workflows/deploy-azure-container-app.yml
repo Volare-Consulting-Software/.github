@@ -1,0 +1,121 @@
+name: deploy-azure-container-app
+
+# Reusable deploy workflow for Volare container apps on Azure Container Apps. Points an
+# existing container app at an image already in its registry (the released version tag),
+# then waits for the new revision to come up healthy. Called from a repo's release.yml on
+# the released event, after the image is promoted.
+#
+# The container app's registry credentials, ingress, secrets and env vars are set up once
+# on the app itself; this workflow only changes the image. A revision that fails to start
+# fails the job, and Container Apps keeps serving the previous revision.
+
+on:
+  workflow_call:
+    inputs:
+      container-app-name:
+        description: "Container app to update. Example: my-api"
+        required: true
+        type: string
+      resource-group:
+        description: "Resource group containing the container app."
+        required: true
+        type: string
+      image:
+        description: "Image repository reference without a tag, including the registry host. Example: registry.example.com/team/my-api"
+        required: true
+        type: string
+      image-tag:
+        description: "Image tag to deploy. Pass the raw release tag (e.g. v10.2.45) — a leading 'v' is stripped here."
+        required: true
+        type: string
+      environment-name:
+        description: "GitHub Environment to bind to for secrets/gating. Defaults to production."
+        required: false
+        type: string
+        default: "production"
+      health-timeout-seconds:
+        description: "How long to wait for the new revision to report Healthy before failing."
+        required: false
+        type: number
+        default: 600
+    secrets:
+      OIDC_CLIENT_ID:
+        required: true
+      OIDC_TENANT_ID:
+        required: true
+      OIDC_SUBSCRIPTION_ID:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment-name }}
+    concurrency:
+      group: deploy-${{ inputs.container-app-name }}-${{ inputs.environment-name }}
+      cancel-in-progress: false
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.OIDC_CLIENT_ID }}
+          tenant-id: ${{ secrets.OIDC_TENANT_ID }}
+          subscription-id: ${{ secrets.OIDC_SUBSCRIPTION_ID }}
+
+      # Strip leading 'v', point the app at the image (creates a new revision), then poll
+      # that revision until it is running and healthy, or fail.
+      - name: Update container app image
+        env:
+          APP: ${{ inputs.container-app-name }}
+          RG: ${{ inputs.resource-group }}
+          IMAGE: ${{ inputs.image }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          TIMEOUT: ${{ inputs.health-timeout-seconds }}
+        run: |
+          set -euo pipefail
+          az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors
+
+          tag="${IMAGE_TAG#v}"
+          image_ref="${IMAGE}:${tag}"
+          echo "Deploying $image_ref to $APP"
+          az containerapp update --name "$APP" --resource-group "$RG" --image "$image_ref" \
+            --only-show-errors --output none
+
+          revision=$(az containerapp show --name "$APP" --resource-group "$RG" \
+            --query properties.latestRevisionName --output tsv)
+          echo "Waiting for revision $revision"
+
+          deadline=$(( $(date +%s) + TIMEOUT ))
+          while :; do
+            running=$(az containerapp revision show --name "$APP" --resource-group "$RG" \
+              --revision "$revision" --query properties.runningState --output tsv)
+            health=$(az containerapp revision show --name "$APP" --resource-group "$RG" \
+              --revision "$revision" --query properties.healthState --output tsv)
+            echo "  runningState=$running healthState=$health"
+
+            case "$running" in
+              Running|RunningAtMaxScale)
+                if [ "$health" = "Healthy" ]; then
+                  echo "Deployed $image_ref ($revision)"
+                  exit 0
+                fi
+                ;;
+              Failed|Degraded|Stopped)
+                echo "Revision $revision did not start ($running). The previous revision keeps serving." >&2
+                exit 1
+                ;;
+            esac
+
+            if [ "$health" = "Unhealthy" ]; then
+              echo "Revision $revision is unhealthy. The previous revision keeps serving." >&2
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "Timed out after ${TIMEOUT}s waiting for $revision to become healthy." >&2
+              exit 1
+            fi
+            sleep 10
+          done
