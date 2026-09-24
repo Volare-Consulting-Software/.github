@@ -6,18 +6,26 @@ name: ef-deploy
 # audit, then applies it via azure/sql-action. Idempotent scripts are safe to re-run,
 # so re-publishing a release is a no-op against an already-migrated database.
 #
-# Passwordless: the job signs in to Azure with GitHub OIDC (OIDC_* secrets) and
-# connects to SQL as that identity (Authentication=Active Directory Default). There is
-# no connection string or password to store. The identity needs a contained database
-# user with rights to apply migrations, e.g.:
-#   CREATE USER [<identity name>] FROM EXTERNAL PROVIDER;
-#   ALTER ROLE db_ddladmin ADD MEMBER [<identity name>];
-#   ALTER ROLE db_datareader ADD MEMBER [<identity name>];
-#   ALTER ROLE db_datawriter ADD MEMBER [<identity name>];
+# Generating the script is cloud-agnostic; only signing in and connecting differ, so
+# `database-auth` picks that part inline (the same pattern as push-container-image's
+# `registry` input):
+#
+#   azure-entra        Passwordless (the standard). Signs in to Azure with GitHub OIDC
+#                      (OIDC_* secrets) and connects to Azure SQL as that identity
+#                      (Authentication=Active Directory Default) using `sql-server` +
+#                      `database`. The identity needs a contained database user, e.g.:
+#                        CREATE USER [<identity name>] FROM EXTERNAL PROVIDER;
+#                        ALTER ROLE db_ddladmin ADD MEMBER [<identity name>];
+#                        ALTER ROLE db_datareader ADD MEMBER [<identity name>];
+#                        ALTER ROLE db_datawriter ADD MEMBER [<identity name>];
+#   connection-string  Any other SQL Server host (e.g. AWS RDS, on-prem) via the
+#                      DB_CONNECTION_STRING secret.
+#   (empty)            connection-string when DB_CONNECTION_STRING is passed,
+#                      otherwise azure-entra.
 #
 # `environment-name` (default production) binds the job to a GitHub Environment for
-# gating. The SQL server's firewall must admit the GitHub-hosted runner. The dotnet-ef
-# tool version is taken from the project's EF Core package version.
+# gating / environment secrets. The database's firewall must admit the GitHub-hosted
+# runner. The dotnet-ef tool version is taken from the project's EF Core package version.
 
 on:
   workflow_call:
@@ -35,14 +43,21 @@ on:
         description: "JSON array of DbContext names to script + apply, e.g. [\"BackOfficeContext\"]."
         required: true
         type: string
+      database-auth:
+        description: "How to reach the database: azure-entra (passwordless, the standard) | connection-string. Empty: connection-string when DB_CONNECTION_STRING is passed, otherwise azure-entra."
+        required: false
+        type: string
+        default: ""
       sql-server:
-        description: "Azure SQL server host name, e.g. my-server.database.windows.net (a bare server name gets .database.windows.net appended)."
-        required: true
+        description: "azure-entra: Azure SQL server host name, e.g. my-server.database.windows.net (a bare server name gets .database.windows.net appended)."
+        required: false
         type: string
+        default: ""
       database:
-        description: "Database to migrate on that server."
-        required: true
+        description: "azure-entra: database to migrate on that server."
+        required: false
         type: string
+        default: ""
       checkout-ref:
         description: "Git ref to script from — the published release tag, so the released migrations are present."
         required: false
@@ -60,12 +75,15 @@ on:
         default: "10.x"
     secrets:
       OIDC_CLIENT_ID:
-        description: "Client ID of the identity GitHub signs in as (app registration or user-assigned managed identity with a federated credential). It needs a user on the target database."
-        required: true
+        description: "azure-entra: client ID of the identity GitHub signs in as (app registration or user-assigned managed identity with a federated credential). It needs a user on the target database."
+        required: false
       OIDC_TENANT_ID:
-        required: true
+        required: false
       OIDC_SUBSCRIPTION_ID:
-        required: true
+        required: false
+      DB_CONNECTION_STRING:
+        description: "connection-string: connection string for the target database. Provide via the GitHub Environment named by environment-name."
+        required: false
 
 permissions:
   contents: read
@@ -163,7 +181,38 @@ jobs:
           path: scripts/${{ matrix.context }}.sql
           if-no-files-found: error
 
-      - name: Log in to Azure
+      # Pick the auth mode and check the caller passed what it needs, before signing in.
+      - name: Resolve database auth
+        id: auth
+        shell: bash
+        env:
+          MODE: ${{ inputs.database-auth }}
+          HAS_CONNECTION_STRING: ${{ secrets.DB_CONNECTION_STRING != '' }}
+          HAS_OIDC: ${{ secrets.OIDC_CLIENT_ID != '' && secrets.OIDC_TENANT_ID != '' && secrets.OIDC_SUBSCRIPTION_ID != '' }}
+          SQL_SERVER: ${{ inputs.sql-server }}
+          DATABASE: ${{ inputs.database }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MODE" ]; then
+            if [ "$HAS_CONNECTION_STRING" = "true" ]; then MODE=connection-string; else MODE=azure-entra; fi
+          fi
+          case "$MODE" in
+            azure-entra)
+              [ "$HAS_OIDC" = "true" ] || { echo "azure-entra needs the OIDC_CLIENT_ID, OIDC_TENANT_ID and OIDC_SUBSCRIPTION_ID secrets." >&2; exit 1; }
+              [ -n "$SQL_SERVER" ] && [ -n "$DATABASE" ] || { echo "azure-entra needs the sql-server and database inputs." >&2; exit 1; }
+              ;;
+            connection-string)
+              [ "$HAS_CONNECTION_STRING" = "true" ] || { echo "connection-string needs the DB_CONNECTION_STRING secret." >&2; exit 1; }
+              ;;
+            *)
+              echo "Unknown database-auth '$MODE' (expected azure-entra or connection-string)." >&2; exit 1
+              ;;
+          esac
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Database auth: $MODE"
+
+      - name: Log in to Azure (azure-entra)
+        if: ${{ steps.auth.outputs.mode == 'azure-entra' }}
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.OIDC_CLIENT_ID }}
@@ -171,7 +220,8 @@ jobs:
           subscription-id: ${{ secrets.OIDC_SUBSCRIPTION_ID }}
 
       # Passwordless connection string: SqlClient signs in with the Azure login above.
-      - name: Build connection string
+      - name: Build passwordless connection string (azure-entra)
+        if: ${{ steps.auth.outputs.mode == 'azure-entra' }}
         shell: bash
         env:
           SQL_SERVER: ${{ inputs.sql-server }}
@@ -188,5 +238,5 @@ jobs:
       - name: Apply idempotent script to database
         uses: azure/sql-action@v2
         with:
-          connection-string: ${{ env.SQL_CONNECTION_STRING }}
+          connection-string: ${{ steps.auth.outputs.mode == 'azure-entra' && env.SQL_CONNECTION_STRING || secrets.DB_CONNECTION_STRING }}
           path: scripts/${{ matrix.context }}.sql
