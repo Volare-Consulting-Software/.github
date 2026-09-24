@@ -1,15 +1,22 @@
 name: ef-deploy
 
-# Reusable workflow that applies EF Core migrations to a database when a release
-# is published. For each context it generates an idempotent SQL script from the
-# released source (offline — no DB connection), uploads it as an artifact for
-# audit, then applies it via azure/sql-action using the DB_CONNECTION_STRING
-# secret. Idempotent scripts are safe to re-run, so re-publishing a release is a
-# no-op against an already-migrated database.
+# Reusable workflow that applies EF Core migrations to an Azure SQL database when a
+# release is published. For each context it generates an idempotent SQL script from
+# the released source (offline — no DB connection), uploads it as an artifact for
+# audit, then applies it via azure/sql-action. Idempotent scripts are safe to re-run,
+# so re-publishing a release is a no-op against an already-migrated database.
 #
-# `environment` (default production) scopes the run to a GitHub Environment so
-# DB_CONNECTION_STRING resolves to that environment's secret. The target SQL
-# Server must allow the GitHub-hosted runner through its firewall. The dotnet-ef
+# Passwordless: the job signs in to Azure with GitHub OIDC (OIDC_* secrets) and
+# connects to SQL as that identity (Authentication=Active Directory Default). There is
+# no connection string or password to store. The identity needs a contained database
+# user with rights to apply migrations, e.g.:
+#   CREATE USER [<identity name>] FROM EXTERNAL PROVIDER;
+#   ALTER ROLE db_ddladmin ADD MEMBER [<identity name>];
+#   ALTER ROLE db_datareader ADD MEMBER [<identity name>];
+#   ALTER ROLE db_datawriter ADD MEMBER [<identity name>];
+#
+# `environment-name` (default production) binds the job to a GitHub Environment for
+# gating. The SQL server's firewall must admit the GitHub-hosted runner. The dotnet-ef
 # tool version is taken from the project's EF Core package version.
 
 on:
@@ -28,13 +35,21 @@ on:
         description: "JSON array of DbContext names to script + apply, e.g. [\"BackOfficeContext\"]."
         required: true
         type: string
+      sql-server:
+        description: "Azure SQL server host name, e.g. my-server.database.windows.net (a bare server name gets .database.windows.net appended)."
+        required: true
+        type: string
+      database:
+        description: "Database to migrate on that server."
+        required: true
+        type: string
       checkout-ref:
         description: "Git ref to script from — the published release tag, so the released migrations are present."
         required: false
         type: string
         default: ""
       environment-name:
-        description: "GitHub Environment whose DB_CONNECTION_STRING secret to use."
+        description: "GitHub Environment to bind the job to (gating / environment secrets)."
         required: false
         type: string
         default: "production"
@@ -44,13 +59,18 @@ on:
         type: string
         default: "10.x"
     secrets:
-      DB_CONNECTION_STRING:
-        description: "Connection string for the target database. Provide via the GitHub Environment named by environment-name."
+      OIDC_CLIENT_ID:
+        description: "Client ID of the identity GitHub signs in as (app registration or user-assigned managed identity with a federated credential). It needs a user on the target database."
+        required: true
+      OIDC_TENANT_ID:
+        required: true
+      OIDC_SUBSCRIPTION_ID:
         required: true
 
 permissions:
   contents: read
   packages: read
+  id-token: write
 
 jobs:
   ef-deploy:
@@ -143,8 +163,30 @@ jobs:
           path: scripts/${{ matrix.context }}.sql
           if-no-files-found: error
 
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.OIDC_CLIENT_ID }}
+          tenant-id: ${{ secrets.OIDC_TENANT_ID }}
+          subscription-id: ${{ secrets.OIDC_SUBSCRIPTION_ID }}
+
+      # Passwordless connection string: SqlClient signs in with the Azure login above.
+      - name: Build connection string
+        shell: bash
+        env:
+          SQL_SERVER: ${{ inputs.sql-server }}
+          DATABASE: ${{ inputs.database }}
+        run: |
+          set -euo pipefail
+          case "$SQL_SERVER" in
+            *.*) host="$SQL_SERVER" ;;
+            *)   host="${SQL_SERVER}.database.windows.net" ;;
+          esac
+          echo "SQL_CONNECTION_STRING=Server=tcp:${host},1433;Initial Catalog=${DATABASE};Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;Authentication=Active Directory Default;" >> "$GITHUB_ENV"
+          echo "Applying to ${DATABASE} on ${host}"
+
       - name: Apply idempotent script to database
         uses: azure/sql-action@v2
         with:
-          connection-string: ${{ secrets.DB_CONNECTION_STRING }}
+          connection-string: ${{ env.SQL_CONNECTION_STRING }}
           path: scripts/${{ matrix.context }}.sql

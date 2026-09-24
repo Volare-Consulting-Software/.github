@@ -69,7 +69,7 @@ This `.github` repo isn't just an org profile — it's Volare's central library 
 | **Azure deploy** | `deploy-azure-app-service`, `deploy-azure-function-app` | Pull a pre-built image from ACR and deploy it to the env-specific App Service / Function App via OIDC, gated through GitHub Environments (`dev` / `staging` / `production`). |
 | **Azure Container Apps deploy** | `deploy-azure-container-app` | Point an existing container app at the released image tag via OIDC and wait for the new revision to report healthy, gated through GitHub Environments. |
 | **AWS deploy** | `deploy-aws-lambda` | Point an existing container Lambda at an image already in ECR (the released version tag) via OIDC and wait for the update, gated through GitHub Environments. |
-| **Database (EF Core)** | `ef-capture-migration`, `ef-deploy` | Auto-capture migration drift on a push to main; generate and apply idempotent migration scripts on release. |
+| **Database (EF Core)** | `ef-capture-migration`, `ef-deploy` | Auto-capture migration drift on a push to main; generate idempotent migration scripts on release and apply them passwordless (GitHub OIDC identity → Azure SQL, Entra auth). |
 | **Housekeeping** | `cancel-on-close` | Kill an in-flight build when its PR is admin-merged or closed, so no runner minutes burn on an outcome no one's waiting on. |
 
 These cover the full path from PR to production — build, test, version, containerize, publish, deploy, and migrate — with consistent tagging, environment gating, and loop-safety baked in.
